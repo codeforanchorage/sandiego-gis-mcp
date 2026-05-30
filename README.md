@@ -79,27 +79,24 @@ curl -sS -X POST https://worcester-gis.codeforanchorage.org/mcp \
 
 ### Verified end-to-end
 
-The deployed connector was checked against the live portal with a real question — *"What active building permits exist for Accessory Dwelling Units (ADUs)?"* — exercising the full chain: type-filtered discovery → `get_dataset` → a `query_data` call with a `where` clause and selected `out_fields`.
+The deployed connector was checked against the live portal with a real question — *"How many active building permits does Worcester have right now?"* — exercising the full chain: type-filtered discovery → `get_layer_schema` → a `query_data` call with a `where` clause.
 
 ```jsonc
 // arcgis__query_data
 {
   "dataset_id": "c2309c7a5f0a491d88aac4a80602e5aa",   // Building Permits (Dept. of Inspectional Services)
-  "where": "Record_Status='Active' AND Permit_For='Accessory Dwelling Unit (ADU)'",
-  "out_fields": "Record__,Address,Date_Submitted,Contractor_Name",
-  "limit": 5
+  "where": "Record_Status='Active'",
+  "limit": 1
 }
 ```
 
-Returned current City records, e.g.:
+The output leads with the full count, so "how many?" needs no paging:
 
-| Permit | Address | Submitted | Contractor |
-| ------ | ------- | --------- | ---------- |
-| B-26-965 | 24 Fairlawn Dr | 3/24/2026 | Aleksander Peci |
-| B-26-1474 | 9 Chadwick St | 4/23/2026 | Kristian Cania |
-| B-26-734 | 21 Moore Ave | 3/8/2026 | Michael Potasky |
+```
+TOTAL MATCHING: 17672
+```
 
-This confirms TLS + custom domain → API Gateway → Lambda → the `arcgis` plugin, including the layer-index resolution, the `type` filter, and `where`/`out_fields` filtering all working against live data.
+This confirms TLS + custom domain → API Gateway → Lambda → the `arcgis` plugin, including the layer-index resolution, the `type` filter, and `where` filtering all working against live data. (Individual records — addresses, contractor names, and so on — are returned when you query for them; they're just not reproduced here.)
 
 ### Writing correct queries: schema → distinct values → query
 
