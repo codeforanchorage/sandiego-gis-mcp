@@ -536,6 +536,17 @@ class ArcGISPlugin(DataPlugin):
     async def search_datasets(
         self, query: str, limit: int = 10, item_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        results = await self._search_items(query, limit, item_type)
+        # Multi-word queries can over-constrain and return nothing; retry once
+        # with the single most distinctive (longest) word rather than give up.
+        if not results and query and len(query.split()) > 1:
+            longest = max(query.split(), key=len)
+            results = await self._search_items(longest, limit, item_type)
+        return results
+
+    async def _search_items(
+        self, query: str, limit: int, item_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"q": query, "limit": limit}
         if item_type:
             # OGC CQL filter; double single quotes to keep the string literal valid.
@@ -555,14 +566,10 @@ class ArcGISPlugin(DataPlugin):
 
         data = response.json()
         features = data.get("features", [])
-        if not features:
-            return []
-
-        results = []
-        for feature in features:
-            props = feature.get("properties", {})
-            results.append(self._extract_dataset_summary(props))
-        return results
+        return [
+            self._extract_dataset_summary(feature.get("properties", {}))
+            for feature in features
+        ]
 
     async def get_dataset(self, dataset_id: str) -> Dict[str, Any]:
         try:
@@ -704,7 +711,13 @@ class ArcGISPlugin(DataPlugin):
                     for b in raw_buckets
                 ]
 
-        return []
+        # Field not aggregatable -- surface the fields the API actually offers
+        # rather than returning a silent empty result.
+        available = [tg.get("field") for tg in terms if tg.get("field")]
+        hint = ", ".join(available) if available else "type, tags, categories, access"
+        raise ValueError(
+            f"'{field}' is not an aggregatable field. Available fields: {hint}."
+        )
 
     # ── Schema / distinct values / spatial point ────────────────────────
 

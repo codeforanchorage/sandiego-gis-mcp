@@ -129,6 +129,31 @@ Returns the attributes of every polygon containing the point (no geometry). Conf
 
 ---
 
+## Try asking
+
+Once the connector is added, just ask Claude in plain English — it picks the right tools. Good prompts to show what it can do:
+
+**Discovery**
+- "What datasets does Worcester publish about permits?" *(type-filtered discovery)*
+- "Break down Worcester's open data catalog by type." *(aggregations — mostly PDFs vs Feature Services)*
+- "What kinds of permit data are there — building, electrical, plumbing?"
+
+**Counts & records**
+- "How many active building permits are there right now?" *(answered from `TOTAL MATCHING`, no paging)*
+- "Show me the 5 most recently submitted ADU permits with addresses." *(`order_by` + `where`)*
+- "What values does the building-permit status field take?" *(`get_distinct_values` → Active / Complete)*
+
+**Schema**
+- "What fields does the parcels dataset have?" *(`get_layer_schema`)*
+
+**Spatial**
+- "Which parcel is at latitude 42.262, longitude -71.802?" *(point-in-polygon)*
+- "What council district contains that point?"
+
+Single keywords match best in discovery; multi-word queries fall back to the most distinctive word automatically if the exact phrase finds nothing.
+
+---
+
 ## Run locally
 
 `config.yaml` is already committed for Worcester (the `arcgis` plugin pointed at `opendata.worcesterma.gov`), so no setup is needed to run the server locally:
