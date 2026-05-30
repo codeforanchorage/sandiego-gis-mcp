@@ -560,6 +560,107 @@ class TestTier1Polish:
         assert "TOTAL MATCHING" not in r.content[0]["text"]
 
 
+# ── multi-word fallback + aggregation field validation ───────────────
+
+
+class TestSearchFallbackAndAggValidation:
+    @staticmethod
+    def _resp(payload):
+        r = Mock()
+        r.raise_for_status = Mock()
+        r.json.return_value = payload
+        return r
+
+    @pytest.mark.asyncio
+    async def test_multiword_fallback_to_longest_word(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        empty = self._resp({"features": []})
+        hit = self._resp(
+            {"features": [{"properties": {"id": "x", "title": "Zoning Districts"}}]}
+        )
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[empty, hit])
+        plugin.hub_client = mock_client
+
+        results = await plugin.search_datasets("zoning districts map", 10)
+
+        assert len(results) == 1
+        assert mock_client.get.call_count == 2
+        # fallback used the longest token ("districts")
+        assert mock_client.get.call_args_list[1].kwargs["params"]["q"] == "districts"
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_first_search_hits(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        hit = self._resp({"features": [{"properties": {"id": "x", "title": "T"}}]})
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=hit)
+        plugin.hub_client = mock_client
+
+        results = await plugin.search_datasets("building permits", 10)
+
+        assert len(results) == 1
+        assert mock_client.get.call_count == 1  # found first try, no fallback
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_for_single_word(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        empty = self._resp({"features": []})
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=empty)
+        plugin.hub_client = mock_client
+
+        results = await plugin.search_datasets("parcels", 10)
+
+        assert results == []
+        assert mock_client.get.call_count == 1  # nothing to fall back to
+
+    @pytest.mark.asyncio
+    async def test_aggregations_unknown_field_raises_hint(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        resp = self._resp(
+            {
+                "aggregations": {
+                    "terms": [
+                        {
+                            "field": "type",
+                            "aggregations": [{"label": "PDF", "value": 5}],
+                        },
+                        {"field": "tags", "aggregations": []},
+                    ]
+                }
+            }
+        )
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=resp)
+        plugin.hub_client = mock_client
+
+        with pytest.raises(ValueError, match="not an aggregatable field"):
+            await plugin.get_aggregations("source")
+
+    @pytest.mark.asyncio
+    async def test_aggregations_valid_field_returns_buckets(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        resp = self._resp(
+            {
+                "aggregations": {
+                    "terms": [
+                        {
+                            "field": "type",
+                            "aggregations": [{"label": "PDF", "value": 5}],
+                        },
+                    ]
+                }
+            }
+        )
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=resp)
+        plugin.hub_client = mock_client
+
+        buckets = await plugin.get_aggregations("type")
+        assert buckets == [{"key": "PDF", "doc_count": 5}]
+
+
 # ── Layer URL helper ───────────────────────────────────────────────────
 
 
