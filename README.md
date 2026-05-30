@@ -73,6 +73,30 @@ curl -sS -X POST https://worcester-gis.codeforanchorage.org/mcp \
                  "arguments":{"q":"permit","type":"Feature Service","limit":5}}}'
 ```
 
+### Verified end-to-end
+
+The deployed connector was checked against the live portal with a real question — *"What active building permits exist for Accessory Dwelling Units (ADUs)?"* — exercising the full chain: type-filtered discovery → `get_dataset` → a `query_data` call with a `where` clause and selected `out_fields`.
+
+```jsonc
+// arcgis__query_data
+{
+  "dataset_id": "c2309c7a5f0a491d88aac4a80602e5aa",   // Building Permits (Dept. of Inspectional Services)
+  "where": "Record_Status='Active' AND Permit_For='Accessory Dwelling Unit (ADU)'",
+  "out_fields": "Record__,Address,Date_Submitted,Contractor_Name",
+  "limit": 5
+}
+```
+
+Returned current City records, e.g.:
+
+| Permit | Address | Submitted | Contractor |
+| ------ | ------- | --------- | ---------- |
+| B-26-965 | 24 Fairlawn Dr | 3/24/2026 | Aleksander Peci |
+| B-26-1474 | 9 Chadwick St | 4/23/2026 | Kristian Cania |
+| B-26-734 | 21 Moore Ave | 3/8/2026 | Michael Potasky |
+
+This confirms TLS + custom domain → API Gateway → Lambda → the `arcgis` plugin, including the layer-index resolution, the `type` filter, and `where`/`out_fields` filtering all working against live data.
+
 ---
 
 ## Run locally
