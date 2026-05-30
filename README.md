@@ -39,10 +39,39 @@ curl -sS -X POST https://worcester-gis.codeforanchorage.org/mcp \
 
 | Tool | Purpose |
 | ---- | ------- |
-| `arcgis__search_datasets` | Discover datasets by keyword (e.g. "parcels", "zoning") |
+| `arcgis__search_datasets` | Discover datasets by keyword (e.g. "parcels", "zoning"). Supports a `type` filter — see below. |
 | `arcgis__get_dataset` | Fetch a dataset's metadata and service URL |
 | `arcgis__query_data` | Query features from a dataset (supports `where`, `out_fields`, `limit`) |
 | `arcgis__get_aggregations` | Facet counts across the catalog (e.g. by `type`, `tags`, `categories`) |
+
+### Cutting through the catalog noise: `type` filter
+
+Worcester's catalog is **document-heavy** — roughly 719 PDFs (reports, forms, filings) alongside ~231 queryable Feature Services — so a bare keyword search often drowns the analyzable data in paperwork. `search_datasets` takes an optional **`type`** argument that restricts results to a single ArcGIS item type. Pass `type: "Feature Service"` to see only data you can query or map.
+
+`search_datasets` arguments:
+
+| Arg | Required | Description |
+| --- | -------- | ----------- |
+| `q` | yes | Full-text search query (single keywords match best; multi-word queries work too) |
+| `type` | no | Restrict to one item type. Use `"Feature Service"` for queryable data; other values: `"PDF"`, `"Web Map"`, `"StoryMap"`, `"Web Mapping Application"` |
+| `limit` | no | Max results, 1–100 (default 10) |
+
+The difference is stark — for example, `q: "election"`:
+
+| Call | Returns |
+| ---- | ------- |
+| `{ "q": "election" }` | 20 results, **all PDFs** |
+| `{ "q": "election", "type": "Feature Service" }` | **14 Feature Services, 0 PDFs** |
+
+Raw JSON-RPC example:
+
+```bash
+curl -sS -X POST https://worcester-gis.codeforanchorage.org/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"arcgis__search_datasets",
+                 "arguments":{"q":"permit","type":"Feature Service","limit":5}}}'
+```
 
 ---
 
