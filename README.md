@@ -14,30 +14,80 @@
 
 ---
 
-## Quick Start
+## Connect to the Worcester server
+
+The server is live. Add it as a custom connector in Claude (same steps on Claude.ai and Claude Desktop):
+
+1. **Settings → Connectors** (or **Customize → Connectors** on claude.ai)
+2. **Add custom connector**
+3. Name it e.g. `Worcester GIS` and paste the URL:
+
+   ```
+   https://worcester-gis.codeforanchorage.org/mcp
+   ```
+
+Quick health check from a terminal:
 
 ```bash
-# 1. Configure (create config, enable one data source)
-cp config-example.yaml config.yaml
-# Edit config.yaml - set enabled: true for one plugin
-
-# 2. Test locally
-pip install aiohttp
-python3 scripts/local_server.py
-
-# 3. Deploy
-./scripts/deploy.sh
+curl -sS -X POST https://worcester-gis.codeforanchorage.org/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+# → {"jsonrpc":"2.0","id":1,"result":{"status":"ok"}}
 ```
 
-Connect via **Claude Connectors** (same steps on both Claude.ai and Claude Desktop):
+### Tools exposed
 
-1. Go to **Settings** → **Connectors** (or **Customize** → **Connectors** on claude.ai)
-2. Click **Add custom connector**
-3. Enter a name (e.g. "Boston OpenData") and your API Gateway URL
+| Tool | Purpose |
+| ---- | ------- |
+| `arcgis__search_datasets` | Discover datasets by keyword (e.g. "parcels", "zoning") |
+| `arcgis__get_dataset` | Fetch a dataset's metadata and service URL |
+| `arcgis__query_data` | Query features from a dataset (supports `where`, `out_fields`, `limit`) |
+| `arcgis__get_aggregations` | Facet counts across the catalog (e.g. by `type`, `tags`, `categories`) |
 
-Get the URL: `cd terraform/aws && terraform output -raw api_gateway_url`
+---
 
-See [Getting Started](docs/GETTING_STARTED.md) for full setup.
+## Run locally
+
+`config.yaml` is already committed for Worcester (the `arcgis` plugin pointed at `opendata.worcesterma.gov`), so no setup is needed to run the server locally:
+
+```bash
+pip install aiohttp pyyaml
+python3 scripts/local_server.py      # serves http://localhost:8000/mcp
+```
+
+On startup it connects to the live portal and registers the four `arcgis__*` tools. Worcester's portal is public, so **no API token is required**. (On a Windows console you may need `PYTHONUTF8=1` for the startup banner's emoji.)
+
+See [Getting Started](docs/GETTING_STARTED.md) for the generic OpenContext setup.
+
+---
+
+## Deploy & operate (Worcester)
+
+Production runs on AWS Lambda + API Gateway behind `worcester-gis.codeforanchorage.org`, in `us-west-2`.
+
+**First-time bootstrap** (state backend, once per account):
+
+```bash
+cd terraform/bootstrap
+terraform init
+terraform apply \
+  -var="aws_region=us-west-2" \
+  -var="state_bucket_name=worcester-gis-opencontext-tfstate" \
+  -var="lock_table_name=terraform-state-lock"
+```
+
+These three values must match `terraform/aws/backend.tf`.
+
+**Deploy / redeploy** (workspace defaults to `worcester-prod`):
+
+```bash
+./scripts/deploy.sh --environment prod
+```
+
+For a code-only change, that single command is all you need. The first stand-up of a new environment also creates an ACM certificate and an API Gateway custom domain — DNS is managed externally (no Route53), so on the first deploy you must:
+
+1. **Validate the cert.** The first apply errors on `CreateDomainName` ("Certificate is not in an ISSUED state") — expected. Create the ACM validation CNAME (`terraform output acm_validation_cname_name`/`_value`, or read it from `aws acm describe-certificate`), wait for `ISSUED`, then re-run the deploy.
+2. **Point the endpoint.** Create a CNAME `worcester-gis.codeforanchorage.org` → `terraform output -raw custom_domain_target`.
 
 ---
 
@@ -70,7 +120,9 @@ pip install pre-commit
 pre-commit install
 ```
 
-Hooks: Ruff, yamllint, gofmt. Run manually: `pre-commit run --all-files`.
+Hooks: Ruff, yamllint, gofmt, plus `detect-private-key` and `gitleaks` secret scanning. Run manually: `pre-commit run --all-files`.
+
+> **Never commit secrets.** `config.yaml` is tracked, so any API token belongs in an environment variable referenced via `${ENV_VAR}` (e.g. `token: "${ARCGIS_TOKEN}"`), never inline. The gitleaks hook will block accidental commits of keys/tokens.
 
 ---
 
