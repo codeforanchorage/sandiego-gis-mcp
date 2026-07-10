@@ -1,4 +1,4 @@
-"""Comprehensive tests for ArcGIS Hub plugin.
+"""Comprehensive tests for the ArcGIS Enterprise portal plugin.
 
 These tests verify plugin initialization, tool execution, API interactions,
 error handling, and data formatting. Tests are designed to fail if functionality breaks.
@@ -18,12 +18,21 @@ from plugins.arcgis.where_validator import WhereValidator
 
 @pytest.fixture
 def arcgis_config():
-    """Standard ArcGIS Hub plugin configuration."""
+    """Standard ArcGIS Enterprise plugin configuration."""
     return {
-        "portal_url": "https://hub.arcgis.com",
+        "portal_url": "https://geo.example.gov/portal",
+        "services_url": "https://geo.example.gov/server/rest/services",
         "city_name": "TestCity",
         "timeout": 120,
     }
+
+
+def _resp(payload, status_code=200):
+    r = Mock()
+    r.status_code = status_code
+    r.raise_for_status = Mock()
+    r.json.return_value = payload
+    return r
 
 
 # ── Plugin attributes ──────────────────────────────────────────────────
@@ -41,21 +50,38 @@ class TestPluginAttributes:
 
 class TestInitialization:
     @pytest.mark.asyncio
-    async def test_initialize_success(self, arcgis_config):
+    async def test_initialize_success_portal_mode(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
 
         with patch("httpx.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
-            mock_response = Mock()
-            mock_response.status_code = 200
-            mock_response.raise_for_status = Mock()
-            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_client.get = AsyncMock(return_value=_resp({"results": []}))
             mock_client_class.return_value = mock_client
 
             result = await plugin.initialize()
 
             assert result is True
             assert plugin._initialized is True
+            assert plugin._search_mode == "portal"
+
+    @pytest.mark.asyncio
+    async def test_initialize_falls_back_to_directory(self, arcgis_config):
+        """Portal search answering with an error body (not anonymous) must
+        fall discovery back to the services-directory walk."""
+        plugin = ArcGISPlugin(arcgis_config)
+
+        gated = _resp({"error": {"code": 499, "message": "Token Required"}})
+        directory = _resp({"folders": [], "services": []})
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=[gated, directory])
+            mock_client_class.return_value = mock_client
+
+            result = await plugin.initialize()
+
+            assert result is True
+            assert plugin._search_mode == "directory"
 
     @pytest.mark.asyncio
     async def test_initialize_failure(self, arcgis_config):
@@ -198,39 +224,53 @@ class TestExecuteTool:
 class TestSearchDatasetsTypeFilter:
     @staticmethod
     def _plugin_capturing_params(arcgis_config):
-        """Plugin whose hub_client records the params of the search request."""
+        """Plugin whose portal_client records the params of the search request."""
         plugin = ArcGISPlugin(arcgis_config)
-        mock_response = Mock()
-        mock_response.raise_for_status = Mock()
-        mock_response.json.return_value = {"features": []}
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_response)
-        plugin.hub_client = mock_client
+        mock_client.get = AsyncMock(return_value=_resp({"results": []}))
+        plugin.portal_client = mock_client
         return plugin, mock_client
 
     @pytest.mark.asyncio
-    async def test_type_filter_adds_cql_filter(self, arcgis_config):
+    async def test_type_filter_added_to_query(self, arcgis_config):
         plugin, mock_client = self._plugin_capturing_params(arcgis_config)
         await plugin.search_datasets("election", 20, "Feature Service")
         params = mock_client.get.call_args.kwargs["params"]
-        assert params["q"] == "election"
-        assert params["limit"] == 20
-        assert params["filter"] == "type='Feature Service'"
+        assert params["q"] == 'election AND type:"Feature Service"'
+        assert params["num"] == 20
+        assert params["f"] == "json"
 
     @pytest.mark.asyncio
-    async def test_no_type_filter_omits_filter_param(self, arcgis_config):
+    async def test_no_type_filter_uses_bare_query(self, arcgis_config):
         plugin, mock_client = self._plugin_capturing_params(arcgis_config)
         await plugin.search_datasets("parks", 10)
         params = mock_client.get.call_args.kwargs["params"]
-        assert "filter" not in params
+        assert params["q"] == "parks"
 
     @pytest.mark.asyncio
-    async def test_type_filter_escapes_single_quotes(self, arcgis_config):
-        # Defend the CQL string literal against injection / breakage.
+    async def test_type_filter_strips_double_quotes(self, arcgis_config):
+        # Defend the quoted phrase against injection / breakage.
         plugin, mock_client = self._plugin_capturing_params(arcgis_config)
-        await plugin.search_datasets("x", 10, "Weird'Type")
+        await plugin.search_datasets("x", 10, 'Weird"Type')
         params = mock_client.get.call_args.kwargs["params"]
-        assert params["filter"] == "type='Weird''Type'"
+        assert params["q"] == 'x AND type:"WeirdType"'
+
+    @pytest.mark.asyncio
+    async def test_search_targets_sharing_rest(self, arcgis_config):
+        plugin, mock_client = self._plugin_capturing_params(arcgis_config)
+        await plugin.search_datasets("parks", 10)
+        assert mock_client.get.call_args[0][0] == "/sharing/rest/search"
+
+    @pytest.mark.asyncio
+    async def test_search_raises_on_error_body(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(
+            return_value=_resp({"error": {"code": 400, "message": "bad q"}})
+        )
+        plugin.portal_client = mock_client
+        with pytest.raises(RuntimeError, match="bad q"):
+            await plugin.search_datasets("parks", 10)
 
     @pytest.mark.asyncio
     async def test_execute_tool_passes_type_through(self, arcgis_config):
@@ -243,6 +283,65 @@ class TestSearchDatasetsTypeFilter:
                 "search_datasets", {"q": "election", "type": "Feature Service"}
             )
         mock_search.assert_awaited_once_with("election", 10, "Feature Service")
+
+
+# ── directory-walk fallback discovery ─────────────────────────────────
+
+
+class TestDirectorySearch:
+    @staticmethod
+    def _plugin(arcgis_config, responses):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        plugin._search_mode = "directory"
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[_resp(p) for p in responses])
+        plugin.feature_client = mock_client
+        return plugin, mock_client
+
+    _ROOT = {
+        "folders": ["Hosted", "GeoDepot"],
+        "services": [{"name": "Bike_Lockers", "type": "FeatureServer"}],
+    }
+    _HOSTED = {
+        "services": [
+            {"name": "Hosted/Parcels", "type": "FeatureServer"},
+            {"name": "Hosted/Parcels_Map", "type": "MapServer"},
+            {"name": "Hosted/Floodplain", "type": "FeatureServer"},
+        ]
+    }
+    _GATED = {"error": {"code": 499, "message": "Token Required"}}
+
+    @pytest.mark.asyncio
+    async def test_directory_search_matches_and_skips_gated_folder(self, arcgis_config):
+        plugin, mock_client = self._plugin(
+            arcgis_config, [self._ROOT, self._HOSTED, self._GATED]
+        )
+        results = await plugin.search_datasets("parcels", 10)
+        # GeoDepot's token error was skipped, not fatal; both parcel
+        # services (Feature + Map) matched.
+        ids = [r["id"] for r in results]
+        assert "Hosted/Parcels/FeatureServer" in ids
+        assert "Hosted/Parcels_Map/MapServer" in ids
+        assert all("Floodplain" not in i for i in ids)
+        assert mock_client.get.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_directory_search_type_filter(self, arcgis_config):
+        plugin, _ = self._plugin(arcgis_config, [self._ROOT, self._HOSTED, self._GATED])
+        results = await plugin.search_datasets("parcels", 10, "Feature Service")
+        assert [r["id"] for r in results] == ["Hosted/Parcels/FeatureServer"]
+        assert results[0]["type"] == "Feature Service"
+        assert results[0]["title"] == "Parcels"
+
+    @pytest.mark.asyncio
+    async def test_directory_listing_is_cached(self, arcgis_config):
+        plugin, mock_client = self._plugin(
+            arcgis_config, [self._ROOT, self._HOSTED, self._GATED]
+        )
+        await plugin.search_datasets("parcels", 10)
+        await plugin.search_datasets("floodplain", 10)  # served from cache
+        assert mock_client.get.call_count == 3
 
 
 # ── schema / distinct values / spatial point ──────────────────────────
@@ -684,23 +783,14 @@ class TestGeocoding:
 
 
 class TestSearchFallbackAndAggValidation:
-    @staticmethod
-    def _resp(payload):
-        r = Mock()
-        r.raise_for_status = Mock()
-        r.json.return_value = payload
-        return r
-
     @pytest.mark.asyncio
     async def test_multiword_fallback_to_longest_word(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
-        empty = self._resp({"features": []})
-        hit = self._resp(
-            {"features": [{"properties": {"id": "x", "title": "Zoning Districts"}}]}
-        )
+        empty = _resp({"results": []})
+        hit = _resp({"results": [{"id": "x", "title": "Zoning Districts"}]})
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=[empty, hit])
-        plugin.hub_client = mock_client
+        plugin.portal_client = mock_client
 
         results = await plugin.search_datasets("zoning districts map", 10)
 
@@ -712,10 +802,10 @@ class TestSearchFallbackAndAggValidation:
     @pytest.mark.asyncio
     async def test_no_fallback_when_first_search_hits(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
-        hit = self._resp({"features": [{"properties": {"id": "x", "title": "T"}}]})
+        hit = _resp({"results": [{"id": "x", "title": "T"}]})
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=hit)
-        plugin.hub_client = mock_client
+        plugin.portal_client = mock_client
 
         results = await plugin.search_datasets("building permits", 10)
 
@@ -725,10 +815,10 @@ class TestSearchFallbackAndAggValidation:
     @pytest.mark.asyncio
     async def test_no_fallback_for_single_word(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
-        empty = self._resp({"features": []})
+        empty = _resp({"results": []})
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=empty)
-        plugin.hub_client = mock_client
+        plugin.portal_client = mock_client
 
         results = await plugin.search_datasets("parcels", 10)
 
@@ -738,47 +828,39 @@ class TestSearchFallbackAndAggValidation:
     @pytest.mark.asyncio
     async def test_aggregations_unknown_field_raises_hint(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
-        resp = self._resp(
-            {
-                "aggregations": {
-                    "terms": [
-                        {
-                            "field": "type",
-                            "aggregations": [{"label": "PDF", "value": 5}],
-                        },
-                        {"field": "tags", "aggregations": []},
-                    ]
-                }
-            }
-        )
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=resp)
-        plugin.hub_client = mock_client
-
         with pytest.raises(ValueError, match="not an aggregatable field"):
             await plugin.get_aggregations("source")
 
     @pytest.mark.asyncio
-    async def test_aggregations_valid_field_returns_buckets(self, arcgis_config):
+    async def test_aggregations_tally_search_results(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
-        resp = self._resp(
-            {
-                "aggregations": {
-                    "terms": [
-                        {
-                            "field": "type",
-                            "aggregations": [{"label": "PDF", "value": 5}],
-                        },
-                    ]
-                }
-            }
-        )
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=resp)
-        plugin.hub_client = mock_client
+        items = [
+            {"id": "a", "type": "Feature Service", "tags": ["parcels", "sandag"]},
+            {"id": "b", "type": "Feature Service", "tags": ["sandag"]},
+            {"id": "c", "type": "Web Map", "tags": []},
+        ]
+        with patch.object(
+            plugin, "_search_items", new_callable=AsyncMock, return_value=items
+        ) as mock_search:
+            buckets = await plugin.get_aggregations("type", q="parcels")
+        mock_search.assert_awaited_once_with("parcels", 100, None)
+        assert buckets == [
+            {"key": "Feature Service", "doc_count": 2},
+            {"key": "Web Map", "doc_count": 1},
+        ]
 
-        buckets = await plugin.get_aggregations("type")
-        assert buckets == [{"key": "PDF", "doc_count": 5}]
+    @pytest.mark.asyncio
+    async def test_aggregations_tally_list_field(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        items = [
+            {"id": "a", "tags": ["parcels", "sandag"]},
+            {"id": "b", "tags": ["sandag"]},
+        ]
+        with patch.object(
+            plugin, "_search_items", new_callable=AsyncMock, return_value=items
+        ):
+            buckets = await plugin.get_aggregations("tags")
+        assert buckets[0] == {"key": "sandag", "doc_count": 2}
 
 
 # ── Layer URL helper ───────────────────────────────────────────────────
@@ -984,33 +1066,295 @@ class TestWhereValidatorAgainstSchema:
 class TestConfigSchema:
     def test_config_schema_valid(self):
         config = ArcGISPluginConfig(
-            portal_url="https://hub.arcgis.com",
-            city_name="Boston",
+            portal_url="https://geo.example.gov/portal",
+            services_url="https://geo.example.gov/server/rest/services",
+            city_name="San Diego",
             timeout=60,
         )
-        assert config.city_name == "Boston"
-        assert config.portal_url == "https://hub.arcgis.com"
+        assert config.city_name == "San Diego"
+        assert config.portal_url == "https://geo.example.gov/portal"
+        assert config.services_url == "https://geo.example.gov/server/rest/services"
         assert config.timeout == 60
         assert config.token is None
+        assert config.geocoder_url == ""
 
     def test_config_schema_rejects_extra_fields(self):
         with pytest.raises(ValidationError):
             ArcGISPluginConfig(
-                portal_url="https://hub.arcgis.com",
-                city_name="Boston",
+                portal_url="https://geo.example.gov/portal",
+                city_name="San Diego",
                 unknown_field="oops",
             )
 
     def test_config_schema_strips_trailing_slash(self):
         config = ArcGISPluginConfig(
-            portal_url="https://hub.arcgis.com/",
-            city_name="Boston",
+            portal_url="https://geo.example.gov/portal/",
+            city_name="San Diego",
         )
-        assert config.portal_url == "https://hub.arcgis.com"
+        assert config.portal_url == "https://geo.example.gov/portal"
 
     def test_config_schema_rejects_invalid_url(self):
         with pytest.raises(ValidationError):
             ArcGISPluginConfig(
                 portal_url="not-a-url",
-                city_name="Boston",
+                city_name="San Diego",
             )
+
+    def test_config_schema_requires_a_discovery_endpoint(self):
+        with pytest.raises(ValidationError, match="portal_url or services_url"):
+            ArcGISPluginConfig(city_name="San Diego")
+
+    def test_config_schema_services_url_only_is_valid(self):
+        config = ArcGISPluginConfig(
+            services_url="https://geo.example.gov/server/rest/services",
+            city_name="San Diego",
+        )
+        assert config.portal_url == ""
+
+
+# ── get_dataset ID forms, caching, and attribution ─────────────────────
+
+
+class TestGetDataset:
+    _ITEM_ID = "032a5dcf654c4ccbb18711ad8a0ee754"
+
+    _PORTAL_ITEM = {
+        "id": _ITEM_ID,
+        "title": "Parcels",
+        "type": "Feature Service",
+        "url": "https://geo.example.gov/server/rest/services/Hosted/Parcels/FeatureServer",
+        "access": "public",
+        "owner": "SanGIS",
+        "tags": ["parcels"],
+        "accessInformation": "SanGIS using legal recorded data",
+        "licenseInfo": "x" * 1000,
+    }
+
+    @staticmethod
+    def _plugin(arcgis_config, portal_payload=None, feature_payload=None):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        portal_client = AsyncMock()
+        portal_client.get = AsyncMock(return_value=_resp(portal_payload or {}))
+        plugin.portal_client = portal_client
+        feature_client = AsyncMock()
+        feature_client.get = AsyncMock(return_value=_resp(feature_payload or {}))
+        plugin.feature_client = feature_client
+        return plugin, portal_client, feature_client
+
+    @pytest.mark.asyncio
+    async def test_portal_item_id_uses_content_endpoint(self, arcgis_config):
+        plugin, portal_client, _ = self._plugin(
+            arcgis_config, portal_payload=self._PORTAL_ITEM
+        )
+        dataset = await plugin.get_dataset(self._ITEM_ID)
+        assert (
+            portal_client.get.call_args[0][0]
+            == f"/sharing/rest/content/items/{self._ITEM_ID}"
+        )
+        assert dataset["service_url"].endswith("/Hosted/Parcels/FeatureServer")
+        assert dataset["attribution"] == "SanGIS using legal recorded data"
+        # The multi-page EULA is excerpted, not inlined wholesale.
+        assert len(dataset["licenseInfo"]) <= 303
+
+    @pytest.mark.asyncio
+    async def test_service_path_id_uses_services_directory(self, arcgis_config):
+        meta = {
+            "serviceDescription": "Tax parcels",
+            "copyrightText": "SanGIS attribution",
+            "layers": [{"id": 0, "name": "Parcels"}],
+        }
+        plugin, _, feature_client = self._plugin(arcgis_config, feature_payload=meta)
+        dataset = await plugin.get_dataset("Hosted/Parcels/FeatureServer")
+        assert feature_client.get.call_args[0][0] == (
+            "https://geo.example.gov/server/rest/services/Hosted/Parcels/FeatureServer"
+        )
+        assert dataset["title"] == "Parcels"
+        assert dataset["type"] == "Feature Service"
+        assert dataset["attribution"] == "SanGIS attribution"
+        assert dataset["service_url"].endswith("/Hosted/Parcels/FeatureServer")
+
+    @pytest.mark.asyncio
+    async def test_invalid_dataset_id_rejected(self, arcgis_config):
+        plugin, portal_client, feature_client = self._plugin(arcgis_config)
+        with pytest.raises(ValueError, match="Invalid dataset ID"):
+            await plugin.get_dataset("https://evil.example.com/FeatureServer")
+        with pytest.raises(ValueError, match="Invalid dataset ID"):
+            await plugin.get_dataset("../../secrets/FeatureServer")
+        portal_client.get.assert_not_called()
+        feature_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_dataset_is_cached(self, arcgis_config):
+        plugin, portal_client, _ = self._plugin(
+            arcgis_config, portal_payload=self._PORTAL_ITEM
+        )
+        first = await plugin.get_dataset(self._ITEM_ID)
+        second = await plugin.get_dataset(self._ITEM_ID)
+        assert portal_client.get.call_count == 1
+        assert first is second
+
+    @pytest.mark.asyncio
+    async def test_portal_item_error_body_raises(self, arcgis_config):
+        plugin, _, _ = self._plugin(
+            arcgis_config,
+            portal_payload={"error": {"code": 400, "message": "Item not found"}},
+        )
+        with pytest.raises(RuntimeError, match="Item not found"):
+            await plugin.get_dataset(self._ITEM_ID)
+
+
+# ── query_data pagination and attribution passthrough ──────────────────
+
+
+class TestPaginationAndAttribution:
+    @pytest.mark.asyncio
+    async def test_query_data_paginates_with_result_offset(self, arcgis_config):
+        """A layer whose MaxRecordCount is below the requested limit must be
+        paged with resultOffset until the limit is satisfied."""
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+
+        page1 = _resp(
+            {
+                "features": [{"attributes": {"i": n}} for n in range(2)],
+                "exceededTransferLimit": True,
+            }
+        )
+        page2 = _resp({"features": [{"attributes": {"i": 2}}]})
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[page1, page2])
+        plugin.feature_client = mock_client
+
+        with patch.object(
+            plugin,
+            "get_dataset",
+            new_callable=AsyncMock,
+            return_value={"id": "a", "service_url": "https://s/FeatureServer/0"},
+        ):
+            records = await plugin.query_data("a", {"where": "1=1"}, 5)
+
+        assert [r["i"] for r in records] == [0, 1, 2]
+        first_params = mock_client.get.call_args_list[0].kwargs["params"]
+        second_params = mock_client.get.call_args_list[1].kwargs["params"]
+        assert "resultOffset" not in first_params
+        assert second_params["resultOffset"] == 2
+        assert second_params["resultRecordCount"] == 3
+
+    @pytest.mark.asyncio
+    async def test_query_params_pin_out_sr_wgs84(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=_resp({"features": []}))
+        plugin.feature_client = mock_client
+        with patch.object(
+            plugin,
+            "get_dataset",
+            new_callable=AsyncMock,
+            return_value={"id": "a", "service_url": "https://s/FeatureServer/0"},
+        ):
+            await plugin.query_data("a", {"where": "1=1"}, 5)
+        assert mock_client.get.call_args.kwargs["params"]["outSR"] == 4326
+
+    @pytest.mark.asyncio
+    async def test_execute_query_data_appends_attribution(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        with (
+            patch.object(
+                plugin, "query_data", new_callable=AsyncMock, return_value=[{"n": "A"}]
+            ),
+            patch.object(
+                plugin, "get_record_count", new_callable=AsyncMock, return_value=1
+            ),
+            patch.object(
+                plugin,
+                "get_dataset",
+                new_callable=AsyncMock,
+                return_value={"id": "a", "attribution": "SanGIS"},
+            ),
+        ):
+            r = await plugin.execute_tool("query_data", {"dataset_id": "a"})
+        assert "Data attribution: SanGIS" in r.content[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_attribution_failure_is_nonfatal(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        with (
+            patch.object(
+                plugin, "query_data", new_callable=AsyncMock, return_value=[{"n": "A"}]
+            ),
+            patch.object(
+                plugin, "get_record_count", new_callable=AsyncMock, return_value=1
+            ),
+            patch.object(
+                plugin,
+                "get_dataset",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            r = await plugin.execute_tool("query_data", {"dataset_id": "a"})
+        assert r.success is True
+        assert "Data attribution" not in r.content[0]["text"]
+
+
+# ── ArcGIS GeocodeServer path ──────────────────────────────────────────
+
+
+class TestArcGISGeocoder:
+    @staticmethod
+    def _plugin(arcgis_config, payload):
+        cfg = dict(arcgis_config)
+        cfg["geocoder_url"] = (
+            "https://gis.example.gov/rest/services/LOCATOR/GeocodeServer"
+        )
+        plugin = ArcGISPlugin(cfg)
+        plugin.plugin_config = ArcGISPluginConfig(**cfg)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=_resp(payload))
+        plugin.feature_client = mock_client
+        return plugin, mock_client
+
+    _CANDIDATES = {
+        "candidates": [
+            {
+                "address": "202 C ST, San Diego, CA, 92101",
+                "location": {"x": -117.1626, "y": 32.7170},
+                "score": 100,
+            },
+            {
+                "address": "Somewhere vague",
+                "location": {"x": -117.0, "y": 32.0},
+                "score": 40,
+            },
+        ]
+    }
+
+    @pytest.mark.asyncio
+    async def test_uses_find_address_candidates(self, arcgis_config):
+        plugin, mock_client = self._plugin(arcgis_config, self._CANDIDATES)
+        out = await plugin.geocode_address("202 C St")
+        url = mock_client.get.call_args[0][0]
+        assert url.endswith("/GeocodeServer/findAddressCandidates")
+        params = mock_client.get.call_args.kwargs["params"]
+        assert params["SingleLine"] == "202 C St"
+        assert params["outSR"] == 4326
+        # weak candidates (score < 60) are dropped
+        assert out == [
+            {
+                "matched_address": "202 C ST, San Diego, CA, 92101",
+                "lon": -117.1626,
+                "lat": 32.7170,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_geocoder_error_body_raises(self, arcgis_config):
+        plugin, _ = self._plugin(
+            arcgis_config, {"error": {"code": 400, "message": "bad address"}}
+        )
+        with pytest.raises(RuntimeError, match="bad address"):
+            await plugin.geocode_address("202 C St")

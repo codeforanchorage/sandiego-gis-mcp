@@ -1,15 +1,21 @@
-"""ArcGIS Hub plugin implementation for OpenContext.
+"""ArcGIS Enterprise portal plugin implementation for OpenContext.
 
-This plugin provides access to ArcGIS Hub open data catalogs
-via the OGC API - Records (Hub Search API) and ArcGIS Feature Services.
+This plugin provides access to an ArcGIS Enterprise deployment (portal +
+server), such as SANDAG/SanGIS's geo.sandag.org. Dataset discovery uses the
+Portal REST API search (``/sharing/rest/search``) when it is open to
+anonymous callers, and falls back to walking the ArcGIS Server services
+directory (``/rest/services``) when it is not. Queries go straight to the
+standard Feature Service ``/query`` endpoints.
 """
 
 import html
 import logging
 import re
+import time
 import unicodedata
+from collections import Counter, OrderedDict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -20,10 +26,26 @@ from plugins.arcgis.where_validator import WhereValidator
 logger = logging.getLogger(__name__)
 
 # US Census oneline geocoder: free, no API key, nationwide, returns WGS84
-# lon/lat that feed directly into spatial_query_point.
+# lon/lat that feed directly into spatial_query_point. Used as the fallback
+# when no ArcGIS GeocodeServer is configured (`geocoder_url`).
 _CENSUS_GEOCODER_URL = (
     "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
 )
+
+# Portal item IDs are 32-char hex; anything else that looks like
+# "Folder/Service/FeatureServer[/N]" is treated as a services-directory path
+# (the ID form produced by directory-walk discovery). The path regex is
+# deliberately strict -- no scheme, no leading slash, no '..' -- so a dataset
+# ID can never be turned into a request to an arbitrary host or path.
+_ITEM_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_SERVICE_PATH_RE = re.compile(
+    r"^[A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-]+)*/(FeatureServer|MapServer)(?:/\d+)?$"
+)
+
+# ArcGIS Enterprise answers requests for auth-gated folders/services with
+# HTTP 200 and an error body carrying one of these codes ("Token Required"
+# is 499). Directory walking must skip these, not fail on them.
+_AUTH_ERROR_CODES = {498, 499, 401, 403}
 
 # HTML-tag stripping and a small unicode->ASCII punctuation map. ArcGIS Hub
 # descriptions are authored as HTML and often contain smart quotes, dashes,
@@ -45,16 +67,17 @@ _UNICODE_PUNCT = {
 
 
 class ArcGISPlugin(DataPlugin):
-    """Plugin for accessing ArcGIS Hub open data catalogs.
+    """Plugin for accessing an ArcGIS Enterprise portal and its services.
 
     This plugin implements the DataPlugin interface and provides tools for
-    searching datasets, retrieving dataset metadata, querying Feature Services,
-    and exploring catalog aggregations.
+    searching the portal catalog (with a services-directory fallback),
+    retrieving dataset metadata, querying Feature Services, and exploring
+    catalog aggregations.
     """
 
     plugin_name = "arcgis"
     plugin_type = PluginType.OPEN_DATA
-    plugin_version = "1.0.0"
+    plugin_version = "2.0.0"
 
     QUERYABLE_TYPES = {
         "Feature Layer",
@@ -63,11 +86,32 @@ class ArcGISPlugin(DataPlugin):
         "Table",
     }
 
+    # Fields get_aggregations can tally. Counts are computed client-side
+    # from the top search results because the portal's countFields API
+    # returns counts only intermittently on this deployment.
+    AGGREGATABLE_FIELDS = ("access", "owner", "tags", "type")
+
+    # get_dataset results are cached briefly: a single query_data tool call
+    # resolves the same dataset up to three times (query, count, attribution).
+    _DATASET_CACHE_TTL = 300.0
+    _DATASET_CACHE_MAX = 128
+
+    # The services directory changes rarely; cache the walk so each search
+    # doesn't re-fetch every folder.
+    _DIRECTORY_CACHE_TTL = 300.0
+
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__(config)
         self.plugin_config: Optional[ArcGISPluginConfig] = None
-        self.hub_client: Optional[httpx.AsyncClient] = None
+        self.portal_client: Optional[httpx.AsyncClient] = None
         self.feature_client: Optional[httpx.AsyncClient] = None
+        # "portal" (sharing/rest/search) or "directory" (services walk).
+        self._search_mode: str = "portal"
+        self._dataset_cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = (
+            OrderedDict()
+        )
+        self._directory_cache: List[Dict[str, Any]] = []
+        self._directory_cache_expiry: float = 0.0
 
     async def initialize(self) -> bool:
         try:
@@ -79,40 +123,80 @@ class ArcGISPlugin(DataPlugin):
                 headers["Authorization"] = f"Bearer {self.plugin_config.token}"
                 feature_headers["Authorization"] = f"Bearer {self.plugin_config.token}"
 
-            self.hub_client = httpx.AsyncClient(
-                base_url=self.plugin_config.portal_url,
-                headers=headers,
-                timeout=self.plugin_config.timeout,
-            )
+            if self.plugin_config.portal_url:
+                self.portal_client = httpx.AsyncClient(
+                    base_url=self.plugin_config.portal_url,
+                    headers=headers,
+                    timeout=self.plugin_config.timeout,
+                )
 
             self.feature_client = httpx.AsyncClient(
                 headers=feature_headers,
                 timeout=self.plugin_config.timeout,
             )
 
-            response = await self.hub_client.get("/api/search/v1/collections")
-            response.raise_for_status()
+            self._search_mode = await self._probe_search_mode()
 
             self._initialized = True
             logger.info(
-                f"ArcGIS Hub plugin initialized successfully for "
-                f"{self.plugin_config.city_name}"
+                f"ArcGIS plugin initialized for {self.plugin_config.city_name} "
+                f"(search mode: {self._search_mode})"
             )
             return True
 
         except Exception as e:
-            logger.error(f"Failed to initialize ArcGIS Hub plugin: {e}", exc_info=True)
+            logger.error(f"Failed to initialize ArcGIS plugin: {e}", exc_info=True)
             return False
 
+    async def _probe_search_mode(self) -> str:
+        """Pick the discovery mechanism: anonymous portal search if it
+        answers, otherwise a services-directory walk. Raises if neither
+        endpoint is usable."""
+        if self.portal_client:
+            try:
+                response = await self.portal_client.get(
+                    "/sharing/rest/search",
+                    params={"q": 'type:"Feature Service"', "num": 1, "f": "json"},
+                )
+                response.raise_for_status()
+                data = response.json()
+                if "error" not in data:
+                    return "portal"
+                logger.warning(
+                    f"Portal search not anonymous "
+                    f"({data['error'].get('message')}); falling back to "
+                    f"services directory"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Portal search probe failed ({e}); falling back to "
+                    f"services directory"
+                )
+        if not self.plugin_config.services_url:
+            raise RuntimeError(
+                "Portal search is unavailable and no services_url is "
+                "configured for directory-walk discovery"
+            )
+        response = await self.feature_client.get(
+            self.plugin_config.services_url, params={"f": "json"}
+        )
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise RuntimeError(
+                f"Services directory error: {data['error'].get('message')}"
+            )
+        return "directory"
+
     async def shutdown(self) -> None:
-        if self.hub_client:
-            await self.hub_client.aclose()
-            self.hub_client = None
+        if self.portal_client:
+            await self.portal_client.aclose()
+            self.portal_client = None
         if self.feature_client:
             await self.feature_client.aclose()
             self.feature_client = None
         self._initialized = False
-        logger.info("ArcGIS Hub plugin shut down")
+        logger.info("ArcGIS plugin shut down")
 
     def get_tools(self) -> List[ToolDefinition]:
         city = self.plugin_config.city_name if self.plugin_config else "Unknown"
@@ -120,11 +204,11 @@ class ArcGISPlugin(DataPlugin):
             ToolDefinition(
                 name="search_datasets",
                 description=(
-                    f"Search {city}'s ArcGIS Hub open data catalog. The catalog is "
-                    "large and document-heavy -- hundreds of PDFs (reports, forms, "
-                    "filings) sit alongside the data -- so to find datasets you can "
-                    "actually query or map, set type='Feature Service'. Each result "
-                    "shows its item type and Hub ID; pass that ID to get_dataset or "
+                    f"Search {city}'s ArcGIS portal catalog. To find datasets "
+                    "you can actually query or map, set type='Feature Service' "
+                    "-- other item types (web maps, apps, service definitions) "
+                    "are not directly queryable. Each result shows its item "
+                    "type and dataset ID; pass that ID to get_dataset or "
                     "query_data."
                 ),
                 input_schema={
@@ -140,8 +224,7 @@ class ArcGISPlugin(DataPlugin):
                                 "Optional: restrict results to one ArcGIS item type. "
                                 "Use 'Feature Service' for queryable spatial/tabular "
                                 "layers (the analyzable data). Other common values: "
-                                "'PDF', 'Web Map', 'StoryMap', 'Web Mapping "
-                                "Application'."
+                                "'Map Service', 'Web Map', 'Web Mapping Application'."
                             ),
                         },
                         "limit": {
@@ -157,13 +240,17 @@ class ArcGISPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="get_dataset",
-                description="Get metadata for a specific ArcGIS Hub dataset by ID",
+                description="Get metadata for a specific dataset by ID",
                 input_schema={
                     "type": "object",
                     "properties": {
                         "dataset_id": {
                             "type": "string",
-                            "description": "32-char hex Hub item ID",
+                            "description": (
+                                "Dataset ID from search_datasets: a 32-char hex "
+                                "portal item ID, or a services-directory path "
+                                "like 'Hosted/Parcels/FeatureServer'"
+                            ),
                         },
                     },
                     "required": ["dataset_id"],
@@ -172,8 +259,9 @@ class ArcGISPlugin(DataPlugin):
             ToolDefinition(
                 name="get_aggregations",
                 description=(
-                    "Get facet counts for a field across the ArcGIS Hub catalog. "
-                    "Useful for exploring available categories, types, or tags."
+                    "Get facet counts for a field across the portal catalog "
+                    "(tallied over the top matching items). Useful for "
+                    "exploring available types, tags, or owners."
                 ),
                 input_schema={
                     "type": "object",
@@ -182,7 +270,7 @@ class ArcGISPlugin(DataPlugin):
                             "type": "string",
                             "description": (
                                 "Field to aggregate. Available fields: "
-                                '"type", "tags", "categories", "access"'
+                                '"type", "tags", "access", "owner"'
                             ),
                         },
                         "q": {
@@ -196,7 +284,7 @@ class ArcGISPlugin(DataPlugin):
             ToolDefinition(
                 name="query_data",
                 description=(
-                    "Query records from an ArcGIS Feature Service by Hub dataset "
+                    "Query records from an ArcGIS Feature Service by dataset "
                     "ID (the plugin resolves the service URL automatically). The "
                     "output leads with TOTAL MATCHING, the full count of records "
                     "matching `where` -- so for 'how many X?' you do not need to "
@@ -209,7 +297,7 @@ class ArcGISPlugin(DataPlugin):
                     "properties": {
                         "dataset_id": {
                             "type": "string",
-                            "description": "Hub item ID (same as get_dataset)",
+                            "description": "Dataset ID (same as get_dataset)",
                         },
                         "where": {
                             "type": "string",
@@ -254,7 +342,7 @@ class ArcGISPlugin(DataPlugin):
                     "properties": {
                         "item_id": {
                             "type": "string",
-                            "description": "Hub item ID of a Feature Service / Table.",
+                            "description": "Dataset ID of a Feature Service / Table.",
                         },
                         "keyword": {
                             "type": "string",
@@ -281,7 +369,7 @@ class ArcGISPlugin(DataPlugin):
                     "properties": {
                         "item_id": {
                             "type": "string",
-                            "description": "Hub item ID of a Feature Service / Table.",
+                            "description": "Dataset ID of a Feature Service / Table.",
                         },
                         "field": {
                             "type": "string",
@@ -330,13 +418,13 @@ class ArcGISPlugin(DataPlugin):
                     "properties": {
                         "item_id": {
                             "type": "string",
-                            "description": "Hub item ID of a polygon Feature Service.",
+                            "description": "Dataset ID of a polygon Feature Service.",
                         },
                         "address": {
                             "type": "string",
                             "description": (
                                 "Street address to geocode (alternative to "
-                                "lon/lat), e.g. '455 Main St' (City Hall). Biased "
+                                "lon/lat), e.g. '202 C St' (City Hall). Biased "
                                 "to the configured region."
                             ),
                         },
@@ -379,17 +467,17 @@ class ArcGISPlugin(DataPlugin):
                 name="geocode_address",
                 description=(
                     "Convert a street address to coordinates (lon/lat, WGS84) via "
-                    "the US Census geocoder. Use the result with "
-                    "spatial_query_point, or call spatial_query_point with "
-                    "`address` directly. Biased to the configured region; include "
-                    "city/state for addresses elsewhere."
+                    "the configured ArcGIS geocoder (or the US Census geocoder "
+                    "as fallback). Use the result with spatial_query_point, or "
+                    "call spatial_query_point with `address` directly. Include "
+                    "city/state for addresses outside the region."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "address": {
                             "type": "string",
-                            "description": "Street address, e.g. '455 Main St' (City Hall).",
+                            "description": "Street address, e.g. '202 C St' (City Hall).",
                         },
                     },
                     "required": ["address"],
@@ -474,7 +562,10 @@ class ArcGISPlugin(DataPlugin):
                         {
                             "type": "text",
                             "text": self._format_query_results(
-                                records, limit, total=total
+                                records,
+                                limit,
+                                total=total,
+                                attribution=await self._attribution_for(dataset_id),
                             ),
                         }
                     ],
@@ -569,7 +660,11 @@ class ArcGISPlugin(DataPlugin):
                         {
                             "type": "text",
                             "text": geocoded_note
-                            + self._format_query_results(records, limit),
+                            + self._format_query_results(
+                                records,
+                                limit,
+                                attribution=await self._attribution_for(item_id),
+                            ),
                         }
                     ],
                     success=True,
@@ -625,58 +720,252 @@ class ArcGISPlugin(DataPlugin):
     async def _search_items(
         self, query: str, limit: int, item_type: Optional[str]
     ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"q": query, "limit": limit}
+        if self._search_mode == "directory":
+            return await self._search_directory(query, limit, item_type)
+        return await self._search_portal(query, limit, item_type)
+
+    async def _search_portal(
+        self, query: str, limit: int, item_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        if query:
+            clauses.append(query)
         if item_type:
-            # OGC CQL filter; double single quotes to keep the string literal valid.
-            safe_type = item_type.replace("'", "''")
-            params["filter"] = f"type='{safe_type}'"
+            # Portal search syntax; strip double quotes to keep the phrase valid.
+            safe_type = item_type.replace('"', "")
+            clauses.append(f'type:"{safe_type}"')
+        params: Dict[str, Any] = {
+            "q": " AND ".join(clauses) if clauses else "access:public",
+            "num": limit,
+            "f": "json",
+        }
         try:
-            response = await self.hub_client.get(
-                "/api/search/v1/collections/all/items",
+            response = await self.portal_client.get(
+                "/sharing/rest/search",
                 params=params,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
-                f"Hub Search API error (HTTP {e.response.status_code}): "
+                f"Portal search error (HTTP {e.response.status_code}): "
                 f"{e.response.text}"
             ) from e
 
         data = response.json()
-        features = data.get("features", [])
-        return [
-            self._extract_dataset_summary(feature.get("properties", {}))
-            for feature in features
-        ]
+        if "error" in data:
+            raise RuntimeError(
+                f"Portal search error: "
+                f"{data['error'].get('message', str(data['error']))}"
+            )
+        return [self._extract_dataset_summary(item) for item in data.get("results", [])]
+
+    # Directory-walk fallback: map ArcGIS item types to server endpoint types.
+    _TYPE_TO_SERVER = {
+        "feature service": "FeatureServer",
+        "map service": "MapServer",
+    }
+    _SERVER_TO_TYPE = {v: k.title() for k, v in _TYPE_TO_SERVER.items()}
+
+    async def _list_services_directory(self) -> List[Dict[str, Any]]:
+        """Walk the services directory (root + one folder level), skipping
+        auth-gated folders, and cache the result briefly."""
+        now = time.monotonic()
+        if self._directory_cache and now < self._directory_cache_expiry:
+            return self._directory_cache
+
+        base = self.plugin_config.services_url
+        response = await self.feature_client.get(base, params={"f": "json"})
+        response.raise_for_status()
+        root = response.json()
+        if "error" in root:
+            raise RuntimeError(
+                f"Services directory error: {root['error'].get('message')}"
+            )
+
+        services = list(root.get("services", []))
+        for folder in root.get("folders", []):
+            try:
+                fresp = await self.feature_client.get(
+                    f"{base}/{folder}", params={"f": "json"}
+                )
+                fresp.raise_for_status()
+                fdata = fresp.json()
+            except Exception as e:
+                logger.warning(f"Skipping services folder {folder}: {e}")
+                continue
+            err = fdata.get("error")
+            if err:
+                # Auth-gated folders (e.g. GeoDepot) answer HTTP 200 with a
+                # "Token Required" error body -- skip them, don't fail.
+                level = (
+                    logger.info
+                    if err.get("code") in _AUTH_ERROR_CODES
+                    else logger.warning
+                )
+                level(f"Skipping services folder {folder}: {err.get('message')}")
+                continue
+            services.extend(fdata.get("services", []))
+
+        self._directory_cache = services
+        self._directory_cache_expiry = now + self._DIRECTORY_CACHE_TTL
+        return services
+
+    async def _search_directory(
+        self, query: str, limit: int, item_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Substring-match service names in the services directory. Dataset
+        IDs in this mode are service paths like 'Hosted/Parcels/FeatureServer'."""
+        server_types = set(self._TYPE_TO_SERVER.values())
+        if item_type:
+            wanted = self._TYPE_TO_SERVER.get(item_type.lower())
+            if not wanted:
+                return []  # directory only serves Feature/Map Services
+            server_types = {wanted}
+
+        terms = [t for t in query.lower().split() if t]
+        results = []
+        for svc in await self._list_services_directory():
+            if svc.get("type") not in server_types:
+                continue
+            name = svc.get("name", "")  # e.g. "Hosted/Parcels"
+            haystack = name.lower().replace("_", " ")
+            if terms and not all(t in haystack for t in terms):
+                continue
+            path = f"{name}/{svc['type']}"
+            results.append(
+                {
+                    "id": path,
+                    "title": name.rsplit("/", 1)[-1].replace("_", " "),
+                    "description": "",
+                    "type": self._SERVER_TO_TYPE[svc["type"]],
+                    "url": f"{self.plugin_config.services_url}/{path}",
+                    "access": "public",
+                    "owner": "",
+                    "created": "",
+                    "modified": "",
+                    "tags": [],
+                    "extent": [],
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
 
     async def get_dataset(self, dataset_id: str) -> Dict[str, Any]:
+        now = time.monotonic()
+        cached = self._dataset_cache.get(dataset_id)
+        if cached and now < cached[0]:
+            self._dataset_cache.move_to_end(dataset_id)
+            return cached[1]
+
+        if _ITEM_ID_RE.match(dataset_id):
+            result = await self._get_portal_item(dataset_id)
+        elif _SERVICE_PATH_RE.match(dataset_id) and ".." not in dataset_id:
+            result = await self._get_directory_service(dataset_id)
+        else:
+            raise ValueError(
+                f"Invalid dataset ID {dataset_id!r}: expected a 32-char hex "
+                f"portal item ID or a service path like "
+                f"'Hosted/Parcels/FeatureServer'"
+            )
+
+        self._dataset_cache[dataset_id] = (now + self._DATASET_CACHE_TTL, result)
+        self._dataset_cache.move_to_end(dataset_id)
+        while len(self._dataset_cache) > self._DATASET_CACHE_MAX:
+            self._dataset_cache.popitem(last=False)
+        return result
+
+    async def _get_portal_item(self, dataset_id: str) -> Dict[str, Any]:
+        if not self.portal_client:
+            raise ValueError(
+                f"Dataset ID {dataset_id!r} is a portal item ID but no "
+                f"portal_url is configured"
+            )
         try:
-            response = await self.hub_client.get(
-                f"/api/search/v1/collections/all/items/{dataset_id}",
+            response = await self.portal_client.get(
+                f"/sharing/rest/content/items/{dataset_id}",
+                params={"f": "json"},
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
-                f"Hub Search API error (HTTP {e.response.status_code}): "
-                f"{e.response.text}"
+                f"Portal item error (HTTP {e.response.status_code}): {e.response.text}"
             ) from e
 
-        feature = response.json()
-        props = feature.get("properties", {})
+        item = response.json()
+        if "error" in item:
+            raise RuntimeError(
+                f"Portal item error: {item['error'].get('message', str(item['error']))}"
+            )
 
-        result = self._extract_dataset_summary(props)
+        result = self._extract_dataset_summary(item)
+        license_info = self._clean_text(item.get("licenseInfo", ""))
+        if len(license_info) > 300:
+            # SanGIS items carry the full multi-page EULA here; the link in
+            # the README covers it, a 300-char excerpt is enough in-band.
+            license_info = license_info[:300] + "..."
         result.update(
             {
-                "snippet": self._clean_text(props.get("snippet", "")),
-                "licenseInfo": self._clean_text(props.get("licenseInfo", "")),
-                "spatialReference": props.get("spatialReference", ""),
-                "geometryType": props.get("geometryType", ""),
-                "additionalResources": props.get("additionalResources", []),
-                "numRecords": props.get("numRecords", None),
-                "service_url": props.get("url", ""),
+                "snippet": self._clean_text(item.get("snippet", "")),
+                "licenseInfo": license_info,
+                "spatialReference": item.get("spatialReference", ""),
+                "geometryType": item.get("geometryType", ""),
+                "additionalResources": [],
+                "numRecords": None,
+                "service_url": item.get("url", ""),
+                # accessInformation is the portal's credits/attribution field
+                # (SanGIS attribution) -- passed through in tool responses.
+                "attribution": self._clean_text(item.get("accessInformation", "")),
             }
         )
         return result
+
+    async def _get_directory_service(self, dataset_id: str) -> Dict[str, Any]:
+        service_url = f"{self.plugin_config.services_url}/{dataset_id}"
+        try:
+            response = await self.feature_client.get(service_url, params={"f": "json"})
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"Service metadata error (HTTP {e.response.status_code}): "
+                f"{e.response.text}"
+            ) from e
+
+        meta = response.json()
+        if "error" in meta:
+            raise RuntimeError(
+                f"Service metadata error: "
+                f"{meta['error'].get('message', str(meta['error']))}"
+            )
+
+        server_type = dataset_id.rstrip("0123456789/").rsplit("/", 1)[-1]
+        name = dataset_id.split("/" + server_type)[0].rsplit("/", 1)[-1]
+        description = self._clean_text(
+            meta.get("serviceDescription") or meta.get("description") or ""
+        )
+        if len(description) > 300:
+            description = description[:300] + "..."
+        return {
+            "id": dataset_id,
+            "title": name.replace("_", " "),
+            "description": description,
+            "type": self._SERVER_TO_TYPE.get(server_type, server_type),
+            "url": service_url,
+            "access": "public",
+            "owner": "",
+            "created": "",
+            "modified": "",
+            "tags": [],
+            "extent": [],
+            "snippet": "",
+            "licenseInfo": "",
+            "spatialReference": "",
+            "geometryType": "",
+            "additionalResources": [],
+            "numRecords": None,
+            "service_url": service_url,
+            "attribution": self._clean_text(meta.get("copyrightText", "")),
+        }
 
     async def query_data(
         self,
@@ -708,96 +997,109 @@ class ArcGISPlugin(DataPlugin):
         service_url = await self._ensure_layer_url(service_url)
         query_url = f"{service_url}/query"
         record_count = min(limit, 1000)
-        params = {
+        base_params = {
             "where": where_clause,
             "outFields": out_fields,
-            "resultRecordCount": record_count,
+            # Layers are stored in a local SR (EPSG:2230 for SANDAG); pin
+            # the output to WGS84 for any geometry the server includes.
+            "outSR": 4326,
             "f": "json",
             "returnGeometry": "false",
         }
         if order_by:
-            params["orderByFields"] = order_by
+            base_params["orderByFields"] = order_by
 
-        try:
-            response = await self.feature_client.get(query_url, params=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise RuntimeError(
-                f"Feature Service query error (HTTP {e.response.status_code}): "
-                f"{e.response.text}"
-            ) from e
+        # Page with resultOffset: a layer's MaxRecordCount can be smaller
+        # than the requested count, in which case the server truncates the
+        # page and sets exceededTransferLimit.
+        records: List[Dict[str, Any]] = []
+        offset = 0
+        while len(records) < record_count:
+            params = dict(base_params)
+            params["resultRecordCount"] = record_count - len(records)
+            if offset:
+                params["resultOffset"] = offset
 
-        try:
-            data = response.json()
-        except Exception as json_err:
-            content_type = response.headers.get("content-type", "")
-            raise ValueError(
-                f"Feature Service returned non-JSON response "
-                f"(content-type: {content_type}). The dataset URL may not "
-                f"point to a queryable ArcGIS Feature Service."
-            ) from json_err
+            try:
+                response = await self.feature_client.get(query_url, params=params)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise RuntimeError(
+                    f"Feature Service query error (HTTP {e.response.status_code}): "
+                    f"{e.response.text}"
+                ) from e
 
-        error_in_body = data.get("error")
-        if error_in_body:
-            code = error_in_body.get("code", "unknown")
-            msg = error_in_body.get("message", "Unknown error")
-            details = error_in_body.get("details", [])
-            detail_str = "; ".join(details) if details else ""
-            raise RuntimeError(
-                f"Feature Service query failed (code {code}): {msg}"
-                + (f" — {detail_str}" if detail_str else "")
-            )
+            try:
+                data = response.json()
+            except Exception as json_err:
+                content_type = response.headers.get("content-type", "")
+                raise ValueError(
+                    f"Feature Service returned non-JSON response "
+                    f"(content-type: {content_type}). The dataset URL may not "
+                    f"point to a queryable ArcGIS Feature Service."
+                ) from json_err
 
-        features = data.get("features", [])
-        if not features:
-            return []
+            error_in_body = data.get("error")
+            if error_in_body:
+                code = error_in_body.get("code", "unknown")
+                msg = error_in_body.get("message", "Unknown error")
+                details = error_in_body.get("details", [])
+                detail_str = "; ".join(details) if details else ""
+                raise RuntimeError(
+                    f"Feature Service query failed (code {code}): {msg}"
+                    + (f" — {detail_str}" if detail_str else "")
+                )
 
-        return [f.get("attributes", {}) for f in features]
+            features = data.get("features", [])
+            records.extend(f.get("attributes", {}) for f in features)
+            if not features or not data.get("exceededTransferLimit"):
+                break
+            offset += len(features)
+
+        return records
 
     # ── Aggregations (standalone helper, not a DataPlugin method) ───────
 
     async def get_aggregations(
         self, field: str, q: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {}
-        if q:
-            params["q"] = q
+        """Tally facet counts for `field` over the top matching items.
 
-        try:
-            response = await self.hub_client.get(
-                "/api/search/v1/collections/all/aggregations", params=params
+        Computed client-side from search results: the portal's countFields
+        parameter returns counts only intermittently on this deployment,
+        and the services-directory fallback has no counts API at all.
+        """
+        if field not in self.AGGREGATABLE_FIELDS:
+            raise ValueError(
+                f"'{field}' is not an aggregatable field. Available fields: "
+                f"{', '.join(self.AGGREGATABLE_FIELDS)}."
             )
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                f"Hub Aggregations API error (HTTP {e.response.status_code}): "
-                f"{e.response.text}"
-            )
-            return []
-
-        data = response.json()
-        logger.debug(f"Aggregations raw response: {data}")
-
-        aggregations = data.get("aggregations", {})
-        terms = aggregations.get("terms", []) if isinstance(aggregations, dict) else []
-
-        for term_group in terms:
-            if term_group.get("field") == field:
-                raw_buckets = term_group.get("aggregations", [])
-                return [
-                    {"key": b.get("label", ""), "doc_count": b.get("value", 0)}
-                    for b in raw_buckets
-                ]
-
-        # Field not aggregatable -- surface the fields the API actually offers
-        # rather than returning a silent empty result.
-        available = [tg.get("field") for tg in terms if tg.get("field")]
-        hint = ", ".join(available) if available else "type, tags, categories, access"
-        raise ValueError(
-            f"'{field}' is not an aggregatable field. Available fields: {hint}."
-        )
+        # 100 is the portal search page cap.
+        items = await self._search_items(q or "", 100, None)
+        counter: Counter = Counter()
+        for item in items:
+            value = item.get(field)
+            if isinstance(value, list):
+                counter.update(str(v) for v in value if v)
+            elif value:
+                counter[str(value)] += 1
+        return [{"key": k, "doc_count": n} for k, n in counter.most_common()]
 
     # ── Schema / distinct values / spatial point ────────────────────────
+
+    async def _attribution_for(self, dataset_id: str) -> str:
+        """Best-effort attribution text for a dataset (SanGIS credits).
+
+        Served from the dataset cache in the common case; never lets an
+        attribution lookup failure break a tool response that already has
+        its data.
+        """
+        try:
+            dataset = await self.get_dataset(dataset_id)
+            return dataset.get("attribution", "") or ""
+        except Exception as e:
+            logger.warning(f"Could not get attribution for {dataset_id}: {e}")
+            return ""
 
     async def _layer_url_for_item(self, item_id: str) -> str:
         """Resolve a Hub item ID to a concrete queryable layer URL."""
@@ -877,6 +1179,7 @@ class ArcGISPlugin(DataPlugin):
             "layer_name": meta.get("name", ""),
             "geometry_type": meta.get("geometryType", ""),
             "layer_url": layer_url,
+            "copyright": self._clean_text(meta.get("copyrightText", "")),
             "fields": fields,
         }
 
@@ -903,6 +1206,7 @@ class ArcGISPlugin(DataPlugin):
             "outFields": field,
             "returnDistinctValues": "true",
             "returnGeometry": "false",
+            "outSR": 4326,
             "orderByFields": field,
             "resultRecordCount": min(max(limit, 1), 1000),
             "f": "json",
@@ -938,6 +1242,7 @@ class ArcGISPlugin(DataPlugin):
             "spatialRel": "esriSpatialRelIntersects",
             "outFields": out_fields,
             "returnGeometry": "false",
+            "outSR": 4326,
             "resultRecordCount": min(max(limit, 1), 50),
             "f": "json",
         }
@@ -945,14 +1250,21 @@ class ArcGISPlugin(DataPlugin):
         return [f.get("attributes", {}) for f in data.get("features", [])]
 
     async def geocode_address(self, address: str) -> List[Dict[str, Any]]:
-        """Geocode a street address to WGS84 lon/lat via the US Census geocoder.
+        """Geocode a street address to WGS84 lon/lat.
 
-        Free and key-less. If `geocoder_region` is configured (e.g.
-        'Worcester, MA') it is appended to bias results to this jurisdiction.
-        Returns candidates with matched_address, lon, and lat.
+        Uses the configured ArcGIS GeocodeServer (`geocoder_url`, e.g. the
+        SANDAG composite locator) when set; otherwise falls back to the free,
+        key-less US Census geocoder. Returns candidates with matched_address,
+        lon, and lat.
         """
         if not address or not address.strip():
             raise ValueError("address is required")
+
+        if self.plugin_config and self.plugin_config.geocoder_url:
+            return await self._geocode_arcgis(address)
+
+        # Census fallback: if `geocoder_region` is configured (e.g.
+        # 'San Diego, CA') it is appended to bias results to this region.
         region = (
             self.plugin_config.geocoder_region if self.plugin_config else ""
         ) or ""
@@ -989,11 +1301,60 @@ class ArcGISPlugin(DataPlugin):
                 )
         return results
 
+    async def _geocode_arcgis(self, address: str) -> List[Dict[str, Any]]:
+        """Geocode via the configured ArcGIS GeocodeServer
+        (findAddressCandidates), pinned to WGS84 output."""
+        params = {
+            "SingleLine": address,
+            "outSR": 4326,
+            "maxLocations": 5,
+            "f": "json",
+        }
+        try:
+            response = await self.feature_client.get(
+                f"{self.plugin_config.geocoder_url}/findAddressCandidates",
+                params=params,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"Geocoder error (HTTP {e.response.status_code}): {e.response.text}"
+            ) from e
+
+        data = response.json()
+        if "error" in data:
+            raise RuntimeError(
+                f"Geocoder error: {data['error'].get('message', str(data['error']))}"
+            )
+        results = []
+        for c in data.get("candidates", []):
+            loc = c.get("location") or {}
+            if loc.get("x") is None or loc.get("y") is None:
+                continue
+            if c.get("score", 0) < 60:
+                continue  # drop weak matches the locator itself doubts
+            results.append(
+                {
+                    "matched_address": c.get("address", ""),
+                    "lon": loc["x"],
+                    "lat": loc["y"],
+                }
+            )
+        return results
+
     # ── Health check ────────────────────────────────────────────────────
 
     async def health_check(self) -> bool:
         try:
-            response = await self.hub_client.get("/api/search/v1/collections")
+            if self._search_mode == "portal" and self.portal_client:
+                response = await self.portal_client.get(
+                    "/sharing/rest/search",
+                    params={"q": 'type:"Feature Service"', "num": 1, "f": "json"},
+                )
+            else:
+                response = await self.feature_client.get(
+                    self.plugin_config.services_url, params={"f": "json"}
+                )
             return response.status_code == 200
         except Exception as e:
             logger.error(f"Health check failed: {e}")
@@ -1116,6 +1477,7 @@ class ArcGISPlugin(DataPlugin):
             f"Spatial Reference: {dataset.get('spatialReference', '')}",
             f"Geometry Type: {dataset.get('geometryType', '')}",
             f"Number of Records: {dataset.get('numRecords', 'N/A')}",
+            f"Attribution: {dataset.get('attribution', '')}",
             f"Tags: {tags}",
             f"Extent: {dataset.get('extent', [])}",
             f"Additional Resources: {dataset.get('additionalResources', [])}",
@@ -1125,12 +1487,19 @@ class ArcGISPlugin(DataPlugin):
         return "\n".join(lines)
 
     def _format_query_results(
-        self, records: List[Dict[str, Any]], limit: int, total: Optional[int] = None
+        self,
+        records: List[Dict[str, Any]],
+        limit: int,
+        total: Optional[int] = None,
+        attribution: str = "",
     ) -> str:
+        # SanGIS requires its attribution to travel with the data.
+        footer = f"\n\nData attribution: {attribution}" if attribution else ""
+
         if not records:
             if total is not None:
-                return f"TOTAL MATCHING: {total}\nNo records on this page."
-            return "No records returned."
+                return f"TOTAL MATCHING: {total}\nNo records on this page." + footer
+            return "No records returned." + footer
 
         lines = []
         if total is not None:
@@ -1145,7 +1514,7 @@ class ArcGISPlugin(DataPlugin):
                 lines.append(f"  {key}: {clean}")
             lines.append("")
 
-        return "\n".join(lines)
+        return "\n".join(lines) + footer
 
     def _format_aggregations(self, field: str, buckets: List[Dict[str, Any]]) -> str:
         if not buckets:
@@ -1168,6 +1537,10 @@ class ArcGISPlugin(DataPlugin):
         lines = [
             f"Layer: {schema.get('layer_name', '')}",
             f"Geometry: {schema.get('geometry_type', '') or 'none (table)'}",
+        ]
+        if schema.get("copyright"):
+            lines.append(f"Attribution: {schema['copyright']}")
+        lines += [
             f"Fields ({len(fields)}):",
             "",
         ]
@@ -1200,9 +1573,12 @@ class ArcGISPlugin(DataPlugin):
 
     def _format_geocode(self, address: str, candidates: List[Dict[str, Any]]) -> str:
         if not candidates:
+            region = (
+                self.plugin_config.geocoder_region if self.plugin_config else ""
+            ) or "City, ST"
             return (
                 f"No geocode match for '{address}'. Try including the city and "
-                f"state, e.g. '{address}, Worcester, MA'."
+                f"state, e.g. '{address}, {region}'."
             )
         lines = [f"{len(candidates)} match(es) for '{address}':", ""]
         for c in candidates:
