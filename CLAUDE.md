@@ -2,7 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**Worcester fork.** This is a Worcester, MA fork of the OpenContext MCP server framework. It is configured to serve the City of Worcester's open data portal (`opendata.worcesterma.gov`), an ArcGIS Hub site, via the built-in `arcgis` plugin (see `config.yaml`).
+**San Diego fork.** This is a San Diego fork of the OpenContext MCP server framework ("San Diego GIS MCP"). It serves SANDAG/SanGIS regional GIS data from SANDAG's ArcGIS Enterprise portal (`geo.sandag.org`) via the built-in `arcgis` plugin (see `config.yaml`). It was adapted from the Worcester, MA fork, which targeted an ArcGIS Hub site.
+
+## Data source: SANDAG/SanGIS ArcGIS Enterprise
+
+Facts verified against the live services (keep these in mind when touching discovery or query code):
+
+- **Services directory:** `https://geo.sandag.org/server/rest/services` — a standard ArcGIS Enterprise services directory. Directory-walking with `?f=json` works anonymously; the `Hosted/` folder is public (Library, Floodplain, parcels, etc.).
+- **Auth-gated folders:** some folders (e.g. `GeoDepot`) require sign-in. Discovery must skip them and handle 401/403/sign-in responses gracefully rather than failing the walk.
+- **Catalog search:** try `https://geo.sandag.org/portal/sharing/rest/search` anonymously first (same API shape as an ArcGIS Online org search). If it is open, use it; if not, fall back to walking the services directory.
+- **Feature queries:** standard `/FeatureServer/<N>/query`. `MaxRecordCount` is 2000 — paginate with `resultOffset`.
+- **Spatial reference:** layers are stored in EPSG:2230 (CA State Plane Zone VI, US feet). Always request `outSR=4326` on queries, and declare `inSR=4326` on point/geometry inputs.
+- **Attribution:** pass each service's `copyrightText` through in tool responses (SanGIS attribution), and link SANDAG's GIS Data Disclaimer in the README.
+- **Geocoder (optional):** `SANDAG_COMPOSITE_LOCATOR` GeocodeServer at `https://gis.sandag.org/sdgis/rest/services` (`findAddressCandidates`).
 
 ## Build & Development Commands
 
