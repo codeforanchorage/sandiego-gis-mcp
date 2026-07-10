@@ -12,7 +12,7 @@
 
 **San Diego GIS MCP** — a San Diego fork of OpenContext. It serves SANDAG/SanGIS regional GIS data from SANDAG's ArcGIS Enterprise portal ([geo.sandag.org](https://geo.sandag.org/portal/home/)) through the built-in `arcgis` plugin: parcels, floodplains, address points, transit, land use, and hundreds of other regional layers.
 
-> **Data disclaimer & attribution.** This server passes each layer's SanGIS/SANDAG attribution through in tool responses. Before using the data, review the SANDAG GIS Data Disclaimer (see SANDAG's [Geographic Information Systems page](https://www.sandag.org/data-and-research/geographic-information-systems)), the [SanGIS Legal Notice](https://gis.sangis.org/sanportal/apps/storymaps/stories/d26146d84e834ff6bcd58e4e620a983a), and the [SANDAG Open Data Terms of Use](https://opendata.sandag.org/stories/s/gt4z-srr7).
+> **Data disclaimer & attribution.** This server passes each layer's SanGIS/SANDAG attribution through in tool responses. Before using the data, review the SANDAG GIS Data Disclaimer (see SANDAG's [Geographic Information Systems page](https://www.sandag.org/data-and-research/geographic-information-systems)), the [SanGIS Legal Notice](https://gis.sangis.org/sanportal/apps/storymaps/stories/d26146d84e834ff6bcd58e4e620a983a), and the [SANDAG Open Data Terms of Use](https://opendata.sandag.org/stories/s/Data-Terms-of-Use/gt4z-srr7/).
 
 ---
 
