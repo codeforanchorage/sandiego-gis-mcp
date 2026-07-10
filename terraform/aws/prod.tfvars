@@ -8,10 +8,10 @@ api_quota_limit = 3000
 api_rate_limit  = 5
 api_burst_limit = 10
 
-# No custom domain yet: the API Gateway URL is used directly. To add one,
-# set e.g. "sandiego-gis.codeforanchorage.org" here and follow the ACM
-# validation + CNAME steps in the README.
-custom_domain = ""
+# DNS for codeforanchorage.org is managed externally (DreamHost): the ACM
+# validation CNAME and the final CNAME to the API Gateway regional domain
+# are created there — see the README deploy steps.
+custom_domain = "sandiego-gis.codeforanchorage.org"
 
 # Cap concurrent Lambda executions. Cost and blast-radius protection if
 # WAF is bypassed via distributed sources. Conversational MCP traffic does
