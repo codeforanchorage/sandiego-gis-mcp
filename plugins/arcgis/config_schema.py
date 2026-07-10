@@ -52,6 +52,14 @@ class ArcGISPluginConfig(BaseModel):
         ),
     )
     city_name: str = Field(..., description="Name of the city/organization")
+    scope_note: str = Field(
+        default="",
+        description=(
+            "Optional one-line catalog-scope / routing hint appended to the "
+            "search_datasets tool description (e.g. pointing models at a "
+            "sibling server for layers this catalog does not hold)."
+        ),
+    )
     timeout: int = Field(
         default=120, ge=1, le=300, description="HTTP request timeout in seconds"
     )

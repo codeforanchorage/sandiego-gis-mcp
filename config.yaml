@@ -8,8 +8,13 @@
 
 ---
 # Server metadata
-server_name: "San Diego GIS MCP"
-description: "San Diego regional GIS MCP server - Safe, conversational access to SANDAG/SanGIS data"
+server_name: "San Diego Regional GIS MCP"
+description: >-
+  San Diego REGIONAL GIS MCP server - safe, conversational access to the
+  SANDAG-hosted regional / SanGIS catalog (geo.sandag.org): parcels,
+  floodplain, address points, regional transportation and land use.
+  Authoritative City of San Diego municipal layers (MHPA, City base zoning,
+  community-plan land use) live on the separate "San Diego City" server.
 organization: "SANDAG/SanGIS"
 
 # Plugin configuration
@@ -38,6 +43,11 @@ plugins:
     services_url: "https://geo.sandag.org/server/rest/services"
     geocoder_url: "https://gis.sandag.org/sdgis/rest/services/SANDAG_COMPOSITE_LOCATOR/GeocodeServer"
     city_name: "the San Diego region"
+    scope_note: >-
+      This is the SANDAG/SanGIS REGIONAL catalog. Authoritative City of San
+      Diego municipal layers (MHPA, City base zoning, community-plan land
+      use) are NOT here -- they live on the separate 'San Diego City' MCP
+      server; use that server for City municipal questions.
     timeout: 120
     geocoder_region: "San Diego, CA" # biases the US Census fallback geocoder
     # token: "${ARCGIS_TOKEN}"  # Optional: Bearer token for private items

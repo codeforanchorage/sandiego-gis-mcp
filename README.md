@@ -10,7 +10,18 @@
 
 ---
 
-**San Diego GIS MCP** — a San Diego fork of OpenContext. It serves SANDAG/SanGIS regional GIS data from SANDAG's ArcGIS Enterprise portal ([geo.sandag.org](https://geo.sandag.org/portal/home/)) through the built-in `arcgis` plugin: parcels, floodplains, address points, transit, land use, and hundreds of other regional layers.
+**San Diego Regional GIS MCP** — a San Diego fork of OpenContext. It serves the **SANDAG-hosted regional / SanGIS catalog** from SANDAG's ArcGIS Enterprise portal ([geo.sandag.org](https://geo.sandag.org/portal/home/)) through the built-in `arcgis` plugin: parcels, floodplains, address points, transit, regional land use, and hundreds of other regional layers.
+
+## Scope: two San Diego servers
+
+San Diego coverage is split across two MCP servers. **This server is the regional one.**
+
+| Server | Backing data | Owns |
+| ------ | ------------ | ---- |
+| **San Diego Regional GIS** (this repo) | SANDAG/SanGIS ArcGIS Enterprise — `geo.sandag.org` | Regional/county-wide layers: parcels, floodplain (FEMA NFHL), address points, roads, transit, regional land use & demographics |
+| **San Diego City** (separate server) | City of San Diego ArcGIS Server — `webmaps.sandiego.gov` | Authoritative City municipal layers: MHPA, City base zoning, community-plan land use |
+
+If a question needs an authoritative **City of San Diego municipal** layer (MHPA boundaries, City base zones, community-plan land use), route it to the **San Diego City** server — this catalog does not hold those layers. The `search_datasets` tool description carries the same routing hint so models pick the right server on their own.
 
 > **Data disclaimer & attribution.** This server passes each layer's SanGIS/SANDAG attribution through in tool responses. Before using the data, review the SANDAG GIS Data Disclaimer (see SANDAG's [Geographic Information Systems page](https://www.sandag.org/data-and-research/geographic-information-systems)), the [SanGIS Legal Notice](https://gis.sangis.org/sanportal/apps/storymaps/stories/d26146d84e834ff6bcd58e4e620a983a), and the [SANDAG Open Data Terms of Use](https://opendata.sandag.org/stories/s/Data-Terms-of-Use/gt4z-srr7/).
 
@@ -18,7 +29,9 @@
 
 ## How it works
 
-Discovery searches SANDAG's portal catalog anonymously (`geo.sandag.org/portal/sharing/rest/search`); if portal search is ever closed off, the plugin automatically falls back to walking the ArcGIS Server services directory (`geo.sandag.org/server/rest/services`), skipping auth-gated folders such as `GeoDepot`. Layers are stored in EPSG:2230 (CA State Plane Zone VI, US feet); every query pins `outSR=4326` and declares point inputs in WGS84 (`inSR=4326`), so all coordinates in and out are plain lon/lat.
+Discovery searches SANDAG's portal catalog anonymously (`geo.sandag.org/portal/sharing/rest/search`); if portal search is ever closed off, the plugin automatically falls back to walking the ArcGIS Server services directory (`geo.sandag.org/server/rest/services`), skipping auth-gated folders such as `GeoDepot`.
+
+**Coordinate contract: WGS84 in, WGS84 out.** SANDAG stores its layers in EPSG:2230 (CA State Plane Zone VI, US feet), but that never leaks to callers: every `/query` request pins `outSR=4326`, every point/geometry input is declared as `inSR=4326`, and the geocoder returns `outSR=4326` — so all coordinates in and out of every tool are plain WGS84 lon/lat (EPSG:4326). This matches the sibling **San Diego City** server, so results from the two servers compose without reprojection.
 
 ### Tools exposed
 

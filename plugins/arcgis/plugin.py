@@ -200,17 +200,21 @@ class ArcGISPlugin(DataPlugin):
 
     def get_tools(self) -> List[ToolDefinition]:
         city = self.plugin_config.city_name if self.plugin_config else "Unknown"
+        scope_note = (self.plugin_config.scope_note if self.plugin_config else "") or ""
+        search_description = (
+            f"Search {city}'s ArcGIS portal catalog. To find datasets "
+            "you can actually query or map, set type='Feature Service' "
+            "-- other item types (web maps, apps, service definitions) "
+            "are not directly queryable. Each result shows its item "
+            "type and dataset ID; pass that ID to get_dataset or "
+            "query_data."
+        )
+        if scope_note:
+            search_description += f" {scope_note}"
         return [
             ToolDefinition(
                 name="search_datasets",
-                description=(
-                    f"Search {city}'s ArcGIS portal catalog. To find datasets "
-                    "you can actually query or map, set type='Feature Service' "
-                    "-- other item types (web maps, apps, service definitions) "
-                    "are not directly queryable. Each result shows its item "
-                    "type and dataset ID; pass that ID to get_dataset or "
-                    "query_data."
-                ),
+                description=search_description,
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -406,10 +410,13 @@ class ArcGISPlugin(DataPlugin):
                 name="spatial_query_point",
                 description=(
                     "Point-in-polygon lookup: return the attributes of every "
-                    "polygon in a dataset that contains a point -- 'which ward / "
-                    "council district / parcel / flood zone is at this location?'. "
+                    "polygon in a dataset that contains a point -- 'which "
+                    "parcel / flood zone / district is at this location?'. "
                     "Provide EITHER a street `address` (geocoded automatically) "
-                    "OR both `lon` and `lat` (WGS84). Use on polygon Feature "
+                    "OR both `lon` and `lat` (WGS84). Coordinates in and out "
+                    "are always WGS84 / EPSG:4326 (inSR=4326 is declared and "
+                    "outSR=4326 requested; the server converts from the "
+                    "layers' native spatial reference). Use on polygon Feature "
                     "Services (check geometry with get_layer_schema). Returns "
                     "attributes only, no geometry."
                 ),
@@ -424,8 +431,8 @@ class ArcGISPlugin(DataPlugin):
                             "type": "string",
                             "description": (
                                 "Street address to geocode (alternative to "
-                                "lon/lat), e.g. '202 C St' (City Hall). Biased "
-                                "to the configured region."
+                                "lon/lat), e.g. '202 C St' (City Hall). "
+                                "Resolved by the configured geocoder."
                             ),
                         },
                         "lon": {
@@ -470,7 +477,8 @@ class ArcGISPlugin(DataPlugin):
                     "the configured ArcGIS geocoder (or the US Census geocoder "
                     "as fallback). Use the result with spatial_query_point, or "
                     "call spatial_query_point with `address` directly. Include "
-                    "city/state for addresses outside the region."
+                    "city/state to disambiguate -- the geocoder covers the "
+                    "whole region, not a single city."
                 ),
                 input_schema={
                     "type": "object",

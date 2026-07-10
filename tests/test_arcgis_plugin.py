@@ -104,6 +104,20 @@ class TestInitialization:
 
 
 class TestGetTools:
+    def test_scope_note_appended_to_search_description(self, arcgis_config):
+        cfg = dict(arcgis_config)
+        cfg["scope_note"] = "City layers live on the sibling server."
+        plugin = ArcGISPlugin(cfg)
+        plugin.plugin_config = ArcGISPluginConfig(**cfg)
+        search = next(t for t in plugin.get_tools() if t.name == "search_datasets")
+        assert search.description.endswith("City layers live on the sibling server.")
+
+    def test_no_scope_note_leaves_description_unchanged(self, arcgis_config):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        search = next(t for t in plugin.get_tools() if t.name == "search_datasets")
+        assert search.description.endswith("get_dataset or query_data.")
+
     def test_get_tools_returns_expected_tools(self, arcgis_config):
         plugin = ArcGISPlugin(arcgis_config)
         plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
