@@ -11,7 +11,7 @@ api_burst_limit = 10
 # DNS for codeforanchorage.org is managed externally (DreamHost): the ACM
 # validation CNAME and the final CNAME to the API Gateway regional domain
 # are created there — see the README deploy steps.
-custom_domain = "sandiego-gis.codeforanchorage.org"
+custom_domain = "sandiego-regional-gis.codeforanchorage.org"
 
 # Cap concurrent Lambda executions. Cost and blast-radius protection if
 # WAF is bypassed via distributed sources. Conversational MCP traffic does

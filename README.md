@@ -150,13 +150,13 @@ The server is live. Add it as a custom connector in Claude (same steps on Claude
 3. Name it e.g. `San Diego GIS` and paste the URL:
 
    ```
-   https://sandiego-gis.codeforanchorage.org/mcp
+   https://sandiego-regional-gis.codeforanchorage.org/mcp
    ```
 
 Quick health check from a terminal:
 
 ```bash
-curl -sS -X POST https://sandiego-gis.codeforanchorage.org/mcp \
+curl -sS -X POST https://sandiego-regional-gis.codeforanchorage.org/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
 # → {"jsonrpc":"2.0","id":1,"result":{"status":"ok"}}
@@ -166,7 +166,7 @@ curl -sS -X POST https://sandiego-gis.codeforanchorage.org/mcp \
 
 ## Deploy & operate
 
-Production runs on AWS Lambda + API Gateway behind `sandiego-gis.codeforanchorage.org`, in `us-west-2`. DNS for `codeforanchorage.org` is managed externally at DreamHost: the ACM validation CNAME and the `sandiego-gis` CNAME (→ `terraform output -raw custom_domain_target`) are created there.
+Production runs on AWS Lambda + API Gateway behind `sandiego-regional-gis.codeforanchorage.org`, in `us-west-2`. DNS for `codeforanchorage.org` is managed externally at DreamHost: the ACM validation CNAME and the `sandiego-regional-gis` CNAME (→ `terraform output -raw custom_domain_target`) are created there.
 
 **First-time bootstrap** (state backend, once per account):
 
