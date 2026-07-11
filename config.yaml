@@ -48,7 +48,10 @@ plugins:
       Diego municipal layers (MHPA, City base zoning, community-plan land
       use) are NOT here -- they live on the separate 'San Diego City' MCP
       server; use that server for City municipal questions.
-    timeout: 120
+    # 25s, not 120: API Gateway hard-caps responses at 29s, so an upstream
+    # timeout must fire BEFORE that to reach the client as a clean JSON-RPC
+    # error instead of an opaque 504. Normal SANDAG queries finish in <5s.
+    timeout: 25
     geocoder_region: "San Diego, CA" # biases the US Census fallback geocoder
     # token: "${ARCGIS_TOKEN}"  # Optional: Bearer token for private items
 
