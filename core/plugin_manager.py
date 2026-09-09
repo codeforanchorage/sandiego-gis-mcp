@@ -289,6 +289,8 @@ class PluginManager:
                     tool_dict["title"] = tool_def.title
                 if tool_def.annotations:
                     tool_dict["annotations"] = tool_def.annotations
+                if tool_def.output_schema:
+                    tool_dict["outputSchema"] = tool_def.output_schema
                 tools.append(tool_dict)
 
         return tools

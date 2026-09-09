@@ -20,6 +20,23 @@ class PluginType(str, Enum):
     ANALYTICS = "analytics"
 
 
+class ToolInputError(ValueError):
+    """A tool argument the CALLER got wrong.
+
+    Distinguishes "you asked for something invalid" from "this server or
+    its upstream broke". The plugin's execute_tool logs these at WARNING
+    with no traceback: a bad dataset id or an unparseable WHERE clause is
+    not a server incident, and a stack trace for one buries real faults.
+
+    Deliberately NOT inferred from ValueError alone: json.JSONDecodeError
+    subclasses ValueError, and "Feature Service returned non-JSON" is a
+    genuine upstream fault that must keep its traceback.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep
+    working unchanged.
+    """
+
+
 class InvalidToolParamsError(ValueError):
     """Raised when a tools/call request is itself malformed.
 
@@ -74,6 +91,16 @@ class ToolDefinition(BaseModel):
             "that hint at a tool's behavior to clients."
         ),
     )
+    output_schema: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional JSON Schema for the tool's structuredContent. A declared "
+            "schema is BINDING: the spec says servers MUST return conforming "
+            "results. Declare one only if EVERY successful return path emits "
+            "conforming structured content -- including the empty, truncated "
+            "and not-found branches."
+        ),
+    )
 
 
 class ToolResult(BaseModel):
@@ -83,6 +110,13 @@ class ToolResult(BaseModel):
         default_factory=list, description="Tool output content"
     )
     success: bool = Field(..., description="Whether the tool execution succeeded")
+    structured_content: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Machine-readable result, surfaced as `structuredContent`. Must "
+            "conform to the tool's declared output_schema."
+        ),
+    )
     error_message: Optional[str] = Field(
         None, description="Error message if execution failed"
     )
