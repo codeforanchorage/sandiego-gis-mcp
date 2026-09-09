@@ -9,7 +9,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from core.plugin_manager import PluginManager
-from core.interfaces import MCPPlugin, ToolDefinition, ToolResult, PluginType
+from core.interfaces import (
+    MCPPlugin,
+    ToolDefinition,
+    ToolResult,
+    PluginType,
+    UnknownToolError,
+)
 from core.validators import ConfigurationError
 
 
@@ -391,10 +397,12 @@ class TestToolExecution:
 
             await manager.load_plugins()
 
-            with pytest.raises(ValueError) as exc_info:
+            with pytest.raises(UnknownToolError) as exc_info:
                 await manager.execute_tool("ckan__nonexistent", {})
 
-            assert "not found" in str(exc_info.value).lower()
+            # Still a ValueError for existing handlers, with the spec's message.
+            assert isinstance(exc_info.value, ValueError)
+            assert str(exc_info.value) == "Unknown tool: ckan__nonexistent"
 
     @pytest.mark.asyncio
     async def test_execute_tool_fails_when_not_initialized(self):

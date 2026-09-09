@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from core.mcp_server import MCPServer
 from core.plugin_manager import PluginManager
-from core.interfaces import ToolResult
+from core.interfaces import ToolResult, UnknownToolError
 
 
 class TestInitialize:
@@ -20,6 +20,7 @@ class TestInitialize:
     async def test_initialize_returns_correct_response(self):
         """Test that initialize returns correct protocol version and capabilities."""
         plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.config = {}
         server = MCPServer(plugin_manager)
 
         request = {
@@ -35,11 +36,62 @@ class TestInitialize:
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 1
         assert "result" in response
+        # No protocolVersion requested -> server falls back to its default.
         assert response["result"]["protocolVersion"] == "2025-03-26"
         assert "capabilities" in response["result"]
         assert "serverInfo" in response["result"]
-        assert response["result"]["serverInfo"]["name"] == "opencontext"
+        # Empty config -> default server name.
+        assert response["result"]["serverInfo"]["name"] == "OpenContext"
         assert response["result"]["serverInfo"]["version"] == "1.0.0"
+        # No instructions configured -> key omitted.
+        assert "instructions" not in response["result"]
+
+    @pytest.mark.asyncio
+    async def test_initialize_negotiates_version_and_uses_config(self):
+        """Initialize echoes a supported requested version and pulls
+        serverInfo name/version + instructions from config."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.config = {
+            "server_name": "San Diego Regional GIS MCP",
+            "server_version": "1.1.0",
+            "instructions": "Start with search_datasets.\n",
+        }
+        server = MCPServer(plugin_manager)
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        }
+
+        response = await server.handle_request(request)
+
+        result = response["result"]
+        # Requested version is supported -> echoed back.
+        assert result["protocolVersion"] == "2025-06-18"
+        assert result["serverInfo"]["name"] == "San Diego Regional GIS MCP"
+        assert result["serverInfo"]["version"] == "1.1.0"
+        # Trailing newline from a YAML block scalar is trimmed.
+        assert result["instructions"] == "Start with search_datasets."
+
+    @pytest.mark.asyncio
+    async def test_initialize_unsupported_version_falls_back(self):
+        """An unrecognized requested version falls back to the default."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.config = {}
+        server = MCPServer(plugin_manager)
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "1999-01-01"},
+        }
+
+        response = await server.handle_request(request)
+
+        assert response["result"]["protocolVersion"] == "2025-03-26"
 
     @pytest.mark.asyncio
     async def test_initialize_notification_returns_none(self):
@@ -259,8 +311,9 @@ class TestToolsCall:
         )
 
     @pytest.mark.asyncio
-    async def test_tools_call_raises_error_when_tool_name_missing(self):
-        """Test that tools/call raises error when tool name is missing."""
+    async def test_tools_call_missing_name_is_invalid_params(self):
+        """A CallToolRequest with no `name` never described a valid call:
+        -32602 "Invalid params", not -32603 "Internal error"."""
         plugin_manager = MagicMock(spec=PluginManager)
         server = MCPServer(plugin_manager)
 
@@ -278,8 +331,52 @@ class TestToolsCall:
 
         assert response is not None
         assert "error" in response
-        assert response["error"]["code"] == -32603
-        assert "Tool name is required" in response["error"]["data"]
+        assert response["error"]["code"] == -32602
+        assert response["error"]["message"] == "Invalid params"
+        assert "name" in response["error"]["data"]
+
+    @pytest.mark.asyncio
+    async def test_tools_call_non_object_arguments_is_invalid_params(self):
+        """`arguments` must be an object; a string must not reach the plugin."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.execute_tool = AsyncMock()
+        server = MCPServer(plugin_manager)
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "arcgis__query_data", "arguments": "1=1"},
+        }
+
+        response = await server.handle_request(request)
+
+        assert response["error"]["code"] == -32602
+        assert "arguments" in response["error"]["data"]
+        plugin_manager.execute_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_is_invalid_params_with_available_list(self):
+        """Naming a missing tool is a caller mistake: -32602 with the spec's
+        "Unknown tool: <name>" message, and the available list in `data`."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.execute_tool = AsyncMock(
+            side_effect=UnknownToolError("nope", "arcgis__one, arcgis__two")
+        )
+        server = MCPServer(plugin_manager)
+
+        response = await server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "nope", "arguments": {}},
+            }
+        )
+
+        assert response["error"]["code"] == -32602
+        assert response["error"]["message"] == "Unknown tool: nope"
+        assert "arcgis__one" in response["error"]["data"]
 
     @pytest.mark.asyncio
     async def test_tools_call_handles_missing_arguments(self):
@@ -317,8 +414,9 @@ class TestPing:
     """Test ping method handling."""
 
     @pytest.mark.asyncio
-    async def test_ping_returns_ok(self):
-        """Test that ping returns ok status."""
+    async def test_ping_returns_empty_object(self):
+        """The spec defines the ping result as an empty object; the liveness
+        signal is the response itself, not its body."""
         plugin_manager = MagicMock(spec=PluginManager)
         server = MCPServer(plugin_manager)
 
@@ -334,7 +432,7 @@ class TestPing:
         assert response is not None
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 1
-        assert response["result"]["status"] == "ok"
+        assert response["result"] == {}
 
 
 class TestNotifications:
@@ -379,8 +477,12 @@ class TestUnknownMethods:
     """Test handling of unknown methods."""
 
     @pytest.mark.asyncio
-    async def test_unknown_method_raises_error(self):
-        """Test that unknown method raises ValueError."""
+    async def test_unknown_method_returns_method_not_found(self):
+        """An unknown method is a caller mistake: -32601, not -32603.
+
+        Clients probe for optional methods routinely; answering "Internal
+        error" claims the server broke and buries real faults in the noise.
+        """
         plugin_manager = MagicMock(spec=PluginManager)
         server = MCPServer(plugin_manager)
 
@@ -395,7 +497,8 @@ class TestUnknownMethods:
 
         assert response is not None
         assert "error" in response
-        assert response["error"]["code"] == -32603
+        assert response["error"]["code"] == -32601
+        assert response["error"]["message"] == "Method not found"
         assert "Unknown method" in response["error"]["data"]
 
 

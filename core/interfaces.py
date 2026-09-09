@@ -20,13 +20,59 @@ class PluginType(str, Enum):
     ANALYTICS = "analytics"
 
 
+class InvalidToolParamsError(ValueError):
+    """Raised when a tools/call request is itself malformed.
+
+    Covers the cases the MCP tools spec calls "requests that fail to
+    satisfy the CallToolRequest schema" -- a missing tool name, or
+    ``arguments`` that is not an object. Mapped to JSON-RPC -32602
+    ("Invalid params"): the request never described a valid call, so it
+    is neither a server fault (-32603) nor a tool execution error.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep
+    working unchanged.
+    """
+
+
+class UnknownToolError(ValueError):
+    """Raised when tools/call names a tool this server does not expose.
+
+    Mapped to JSON-RPC -32602 with the message shape the MCP tools spec
+    uses ("Unknown tool: <name>") rather than the generic -32603
+    "Internal error": naming a missing tool is a caller mistake, not a
+    server fault. The available-tool list travels in ``data`` so a model
+    can self-correct.
+    """
+
+    def __init__(self, tool_name: str, available: str = "") -> None:
+        self.tool_name = tool_name
+        self.available = available
+        super().__init__(f"Unknown tool: {tool_name}")
+
+
 class ToolDefinition(BaseModel):
     """Definition of an MCP tool provided by a plugin."""
 
     name: str = Field(..., description="Tool name (without plugin prefix)")
+    title: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional human-readable display name. Clients resolve a tool's "
+            "display name as title -> annotations.title -> name, so this is "
+            "what users see in a tool picker while `name` stays the stable "
+            "programmatic identifier."
+        ),
+    )
     description: str = Field(..., description="Human-readable tool description")
     input_schema: Dict[str, Any] = Field(
         ..., description="JSON Schema for tool input parameters"
+    )
+    annotations: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional MCP tool annotations (e.g. readOnlyHint, openWorldHint) "
+            "that hint at a tool's behavior to clients."
+        ),
     )
 
 
