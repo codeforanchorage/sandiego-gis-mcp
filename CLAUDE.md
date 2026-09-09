@@ -79,7 +79,7 @@ New plugins must implement `MCPPlugin` (or `DataPlugin` for data sources). Place
 
 ## Configuration
 
-Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config supports `${ENV_VAR}` substitution. For Lambda, config is serialized to the `OPENCONTEXT_CONFIG` env var by Terraform.
+Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config supports `${ENV_VAR}` substitution. For Lambda, `scripts/deploy.sh` ships `config.yaml` inside the package and the handler reads it from `$LAMBDA_TASK_ROOT`; the `OPENCONTEXT_CONFIG` env var is left empty because the full config (with the `instructions` block) exceeds Lambda's 4KB env-var cap. Top-level `server_name`, `server_version`, and `instructions` are surfaced in the MCP `initialize` response.
 
 ## CI
 

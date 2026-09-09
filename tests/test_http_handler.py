@@ -9,7 +9,12 @@ import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from server.http_handler import UniversalHTTPHandler, _initialize_server, _load_config
+from server.http_handler import (
+    UniversalHTTPHandler,
+    _initialize_server,
+    _load_config,
+    _packaged_config_path,
+)
 from core.validators import ConfigurationError
 
 
@@ -486,7 +491,14 @@ class TestConfigLoading:
             server.http_handler._config = None
 
             _load_config()
-            mock_load.assert_called_once_with("config.yaml")
+            mock_load.assert_called_once_with(_packaged_config_path())
+
+    def test_packaged_config_path_resolves_under_lambda_task_root(self):
+        """On Lambda the package lives at $LAMBDA_TASK_ROOT, not the CWD."""
+        with patch.dict(os.environ, {"LAMBDA_TASK_ROOT": "/var/task"}):
+            assert _packaged_config_path() == os.path.join("/var/task", "config.yaml")
+        with patch.dict(os.environ, {}, clear=True):
+            assert _packaged_config_path() == os.path.join(".", "config.yaml")
 
     def test_load_config_raises_on_invalid_json(self):
         """Test that invalid JSON in environment variable raises error."""

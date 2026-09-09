@@ -248,6 +248,10 @@ cp -r plugins "$PACKAGE_DIR/"
 cp -r custom_plugins "$PACKAGE_DIR/" 2>/dev/null || mkdir -p "$PACKAGE_DIR/custom_plugins"
 cp -r server "$PACKAGE_DIR/"
 cp requirements.txt "$PACKAGE_DIR/" 2>/dev/null || true
+# Ship config.yaml inside the package: the runtime reads it from
+# $LAMBDA_TASK_ROOT (server/http_handler.py) because the full config, with
+# the server `instructions` block, exceeds Lambda's 4KB env-var limit.
+cp config.yaml "$PACKAGE_DIR/"
 
 # Install Python dependencies into package directory
 echo "Installing Python dependencies..."

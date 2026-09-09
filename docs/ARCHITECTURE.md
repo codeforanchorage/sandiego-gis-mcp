@@ -154,7 +154,7 @@ class MCPPlugin(ABC):
 
 ## Configuration
 
-Single `config.yaml`; passed to Lambda via `OPENCONTEXT_CONFIG`. Validated at deploy and runtime.
+Single `config.yaml`, shipped inside the Lambda package and read from `$LAMBDA_TASK_ROOT` at runtime (the `OPENCONTEXT_CONFIG` env var is left empty: with the server `instructions` block the config exceeds Lambda's 4KB env-var cap). Validated at deploy and runtime.
 
 ## Security & Scalability
 

@@ -25,6 +25,17 @@
 server_name: "Your Organization OpenData MCP" # e.g., "Boston OpenData MCP"
 description: "Your organization's open data MCP server - Safe, conversational access to your open data"
 organization: "Your Organization Name" # e.g., "City of Boston"
+# Surfaced in the MCP `initialize` response as serverInfo.version. Bump it
+# with any behaviour change worth telling a client apart by.
+server_version: "1.0.0"
+
+# Optional per-deployment guidance returned in the MCP `initialize` response
+# as `instructions`. Clients prepend it to the model's context once, so this
+# is the place for workflow hints, data caveats, and routing to sibling
+# servers -- rather than repeating them in every tool description.
+# instructions: |
+#   You are connected to ... Start with search_datasets, then
+#   get_layer_schema before writing any WHERE clause.
 
 # Plugin configuration
 # ====================

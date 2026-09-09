@@ -101,9 +101,9 @@ surface, and must stay in sync:
 
 ### Configuration and secrets
 
-- **No secrets in `config.yaml`.** Config is serialized into the
-  `OPENCONTEXT_CONFIG` Lambda environment variable in plaintext
-  (`terraform/aws/main.tf`). This is an **invariant**: any future
+- **No secrets in `config.yaml`.** Config ships in plaintext inside the
+  Lambda deployment package (`scripts/deploy.sh`), and is tracked in git.
+  This is an **invariant**: any future
   plugin secret must go via AWS Secrets Manager or SSM Parameter Store
   with KMS, never the env var. CI should enforce this if a secret-
   bearing plugin is ever added.
