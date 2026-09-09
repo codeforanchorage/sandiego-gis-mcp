@@ -16,6 +16,51 @@ description: >-
   Authoritative City of San Diego municipal layers (MHPA, City base zoning,
   community-plan land use) live on the separate "San Diego City" server.
 organization: "SANDAG/SanGIS"
+# Surfaced in the MCP `initialize` response as serverInfo.version. Bump it
+# with any behaviour change worth telling a client apart by.
+server_version: "1.1.0"
+
+# Per-deployment guidance returned in the MCP `initialize` response as
+# `instructions`. Model-agnostic: clients prepend it to the model's context
+# once, before any tool is called, so this is the highest-leverage place for
+# the workflow, the coordinate-system facts, attribution, and routing to the
+# sibling City server. Shipped inside the Lambda package (not the 4KB env
+# var) -- see scripts/deploy.sh.
+instructions: |
+  You are connected to the SANDAG/SanGIS REGIONAL GIS catalog for the San
+  Diego region (geo.sandag.org): parcels, floodplain, address points,
+  regional transportation and land use, and hundreds of other layers
+  published by SANDAG and its member agencies.
+
+  Workflow:
+  1. search_datasets(q, type='Feature Service') to find queryable layers.
+     Each result shows a dataset ID (a 32-char portal item ID or a
+     'Folder/Service/FeatureServer' path); pass that ID to the other tools.
+  2. get_layer_schema(item_id) BEFORE writing any WHERE clause: field names
+     are CASE-SENSITIVE and coded-value domains are listed there. Use
+     get_distinct_values to confirm the exact spelling of a code.
+  3. query_data for records and counts -- the response leads with TOTAL
+     MATCHING, so 'how many X?' questions need no paging -- and
+     spatial_query_point with a street address or lon/lat for 'what parcel /
+     flood zone / district is at this location?'.
+
+  Data facts to apply to every answer:
+  - Coordinates in and out are WGS84 (EPSG:4326). Layers are stored in CA
+    State Plane Zone VI (US feet); the server converts, you never need to.
+  - Every data response ends with a SanGIS attribution line. Keep that
+    attribution with any figures or records you report.
+  - An empty result means no records matched the filter, not that the layer
+    or the feature is missing: re-check the schema and distinct values.
+  - Some catalog folders (e.g. GeoDepot) are sign-in only and are not
+    searchable here.
+
+  Scope: this server is the REGIONAL catalog only. Authoritative City of San
+  Diego municipal layers (MHPA, City base zoning, community-plan land use)
+  live on the separate 'San Diego City GIS' MCP server -- use that server for
+  City municipal questions.
+
+  All tools are READ-ONLY and safe to call without confirmation.
+
 
 # Plugin configuration
 # ====================
