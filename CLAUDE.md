@@ -83,4 +83,4 @@ Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config s
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs ruff lint/format, pip-audit, pytest with coverage, and Go tests on push to main/develop and on PRs.
+GitHub Actions (`.github/workflows/ci.yml`) runs ruff check + format (pinned to the `ruff==` version in `pyproject.toml`, which must match the rev in `.pre-commit-config.yaml`), pytest with an 80% coverage gate (inert plugins and the legacy Lambda entry point are omitted in `pyproject.toml`), pip-audit on `requirements.txt`, Go vet/test for `client/`, and `terraform fmt -check`, on push to main/develop and on PRs. No job holds AWS credentials, so `terraform validate` is deliberately not run.

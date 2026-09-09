@@ -24,7 +24,12 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
-    "ruff>=0.1.0",
+    # PINNED, not floating: a floating `ruff>=0.1.0` lets CI resolve to
+    # whatever ruff released most recently and check rules this tree has
+    # never been run against. Keep this equal to the rev in
+    # .pre-commit-config.yaml so a contributor's hook, a local run and CI
+    # all reach the same verdict. Bump both together, deliberately.
+    "ruff==0.15.11",
     "pip-audit>=2.0.0",
 ]
 
@@ -50,4 +55,10 @@ omit = [
     "*/tests/*",
     "*/core/logging_utils.py",
     "*/plugins/ckan/plugin.py",
+    # Inert in this fork: config.yaml has no entry for it, so it can never
+    # be loaded here (One Fork = One Plugin). 1.8k statements at 67% would
+    # otherwise dominate the number the gate measures.
+    "*/plugins/anchorage_gis/*",
+    # Legacy entry point; Terraform wires server.adapters.aws_lambda.
+    "*/server/lambda_handler.py",
 ]

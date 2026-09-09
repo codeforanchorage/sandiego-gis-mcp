@@ -1,0 +1,148 @@
+---
+# CI for the San Diego Regional GIS MCP server.
+#
+# CLAUDE.md described a workflow at this path that had never existed in this
+# fork (the paragraph came along from upstream OpenContext), so every push was
+# checked only by whatever the author happened to run locally. Each job below
+# was verified against the tree that introduced it, so this arrives green.
+#
+# DELIBERATELY ABSENT: `terraform validate`. It requires `terraform init`
+# against the S3 backend, and CI holds no AWS credentials by design --
+# nothing reachable from a pull request should be able to read or touch
+# deployment state. `terraform fmt` needs neither and is enforced below.
+
+name: CI
+
+"on":
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The version AWS Lambda runs, and the one scripts/deploy.sh installs
+  # wheels for. CI tests what production executes.
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      # Scoped to the same four directories as .pre-commit-config.yaml.
+      # scripts/ is deliberately outside it: those entry points must set
+      # sys.path before importing from core/, which is an unavoidable E402.
+      # The ruff version is PINNED in pyproject.toml [dev] and must equal the
+      # rev in .pre-commit-config.yaml so hook, local and CI agree.
+      - name: ruff version (pinned; must match .pre-commit-config.yaml)
+        run: ruff --version
+
+      - name: ruff check
+        run: ruff check core/ plugins/ server/ tests/
+
+      - name: ruff format --check
+        run: ruff format --check core/ plugins/ server/ tests/
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      # config.yaml is tracked in this fork (it is the SANDAG deployment's
+      # config, with no secrets), so the suite sees the same file deploy.sh
+      # ships. Nothing here calls geo.sandag.org: the live checks live in
+      # scripts/smoke_*.py and are run by hand, so CI is never gated on a
+      # third party being up. Coverage omissions (inert plugins, the legacy
+      # Lambda entry point) are listed in pyproject.toml [tool.coverage.run].
+      - name: pytest with coverage
+        run: |
+          pytest tests/ -n auto \
+            --cov=core --cov=plugins --cov=server \
+            --cov-report=term-missing \
+            --cov-fail-under=80
+
+  security:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip && pip install pip-audit
+
+      # requirements.txt only -- that is what ships inside the Lambda
+      # package and is therefore the surface that is actually exposed. Test
+      # and tooling dependencies never reach production.
+      - name: Audit runtime dependencies
+        run: pip-audit -r requirements.txt --progress-spinner off
+
+  go-client:
+    name: go client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.21"
+          cache-dependency-path: client/go.mod
+
+      # The stdio bridge Claude Desktop/Code runs. Its tests use
+      # httptest.NewServer, so they need no network and no external module.
+      - name: go vet
+        working-directory: client
+        run: go vet ./...
+
+      - name: go test
+        working-directory: client
+        run: go test ./...
+
+  terraform:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.8"
+          terraform_wrapper: false
+
+      # Formatting only. `terraform validate` needs `terraform init`, which
+      # needs credentials for the S3 backend, and CI has none by design --
+      # nothing here should be able to read or touch deployment state.
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive terraform/
