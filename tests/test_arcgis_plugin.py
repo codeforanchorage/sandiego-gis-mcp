@@ -214,9 +214,12 @@ class TestExecuteTool:
 
         with patch.object(
             plugin,
-            "query_data",
+            "_fetch_records",
             new_callable=AsyncMock,
-            return_value=[{"name": "Park A", "status": "Open"}],
+            return_value=(
+                [{"name": "Park A", "status": "Open"}],
+                {"pages": 1, "exceeded_transfer_limit": False},
+            ),
         ):
             result = await plugin.execute_tool("query_data", {"dataset_id": "abc123"})
 
@@ -667,7 +670,13 @@ class TestTier1Polish:
         plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
         with (
             patch.object(
-                plugin, "query_data", new_callable=AsyncMock, return_value=[{"n": "A"}]
+                plugin,
+                "_fetch_records",
+                new_callable=AsyncMock,
+                return_value=(
+                    [{"n": "A"}],
+                    {"pages": 1, "exceeded_transfer_limit": False},
+                ),
             ),
             patch.object(
                 plugin, "get_record_count", new_callable=AsyncMock, return_value=4242
@@ -682,7 +691,13 @@ class TestTier1Polish:
         plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
         with (
             patch.object(
-                plugin, "query_data", new_callable=AsyncMock, return_value=[{"n": "A"}]
+                plugin,
+                "_fetch_records",
+                new_callable=AsyncMock,
+                return_value=(
+                    [{"n": "A"}],
+                    {"pages": 1, "exceeded_transfer_limit": False},
+                ),
             ),
             patch.object(
                 plugin,
@@ -843,7 +858,7 @@ class TestGeocoding:
             )
         assert result.success is True
         assert mock_spatial.call_count == 1
-        assert "No records returned" in result.content[0]["text"]
+        assert "Returned 0 record(s)" in result.content[0]["text"]
 
     @pytest.mark.asyncio
     async def test_spatial_query_point_unresolvable_address(self, arcgis_config):
@@ -1352,7 +1367,13 @@ class TestPaginationAndAttribution:
         plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
         with (
             patch.object(
-                plugin, "query_data", new_callable=AsyncMock, return_value=[{"n": "A"}]
+                plugin,
+                "_fetch_records",
+                new_callable=AsyncMock,
+                return_value=(
+                    [{"n": "A"}],
+                    {"pages": 1, "exceeded_transfer_limit": False},
+                ),
             ),
             patch.object(
                 plugin, "get_record_count", new_callable=AsyncMock, return_value=1
@@ -1373,7 +1394,13 @@ class TestPaginationAndAttribution:
         plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
         with (
             patch.object(
-                plugin, "query_data", new_callable=AsyncMock, return_value=[{"n": "A"}]
+                plugin,
+                "_fetch_records",
+                new_callable=AsyncMock,
+                return_value=(
+                    [{"n": "A"}],
+                    {"pages": 1, "exceeded_transfer_limit": False},
+                ),
             ),
             patch.object(
                 plugin, "get_record_count", new_callable=AsyncMock, return_value=1

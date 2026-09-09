@@ -18,7 +18,13 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
+
+try:  # optional: full schema validation when jsonschema is installed
+    from jsonschema import Draft202012Validator
+except ImportError:  # pragma: no cover
+    Draft202012Validator = None
 
 URL = (
     (sys.argv[1] if len(sys.argv) > 1 else None)
@@ -49,6 +55,37 @@ def rpc(method, params=None):
         body = json.loads(r.read().decode())
     time.sleep(0.4)  # pace under 5 rps
     return body
+
+
+def raw(method="POST", payload=None, headers=None):
+    """Low-level request that returns (status, headers, body) and never
+    raises on 4xx/5xx -- the conformance checks assert on those."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    hdrs = {"Accept": "application/json"}
+    if data is not None:
+        hdrs["Content-Type"] = "application/json"
+    hdrs.update(headers or {})
+    req = urllib.request.Request(URL, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            status, resp_headers, body = r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        status, resp_headers, body = e.code, dict(e.headers), e.read()
+    time.sleep(0.4)  # pace under 5 rps
+    try:
+        parsed = json.loads(body.decode()) if body else None
+    except ValueError:
+        parsed = body.decode(errors="replace")
+    return status, {k.lower(): v for k, v in resp_headers.items()}, parsed
+
+
+def jsonrpc(method, params=None):
+    global _id
+    _id += 1
+    payload = {"jsonrpc": "2.0", "id": _id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    return payload
 
 
 def call_tool(name, args):
@@ -289,6 +326,239 @@ try:
     check("get_aggregations(type)", "dataset(s)" in t, t.replace("\n", " ")[:60])
 except Exception as e:
     check("get_aggregations(type)", False, repr(e))
+
+# ── MCP conformance surface ────────────────────────────────────────────
+# Mirrors the checks the sibling forks run after every deploy.
+
+try:
+    r = rpc(
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "smoke", "version": "0"},
+        },
+    )
+    echoed = r["result"]["protocolVersion"] == "2025-06-18"
+    instr = r["result"].get("instructions", "")
+    info = r["result"]["serverInfo"]
+    check(
+        "initialize negotiates version + carries instructions",
+        echoed and len(instr) > 200 and info["name"] != "opencontext",
+        f"echo={echoed} instructions={len(instr)} chars serverInfo={info}",
+    )
+except Exception as e:
+    check("initialize negotiates version + carries instructions", False, repr(e))
+
+try:
+    tools_by_name = {t["name"]: t for t in rpc("tools/list")["result"]["tools"]}
+    missing = sorted(
+        n
+        for n, t in tools_by_name.items()
+        if not t.get("title")
+        or t.get("annotations", {}).get("readOnlyHint") is not True
+        or "idempotentHint" in t.get("annotations", {})
+        or not t.get("outputSchema")
+    )
+    check(
+        "tools/list metadata (title + readOnlyHint + outputSchema)",
+        not missing,
+        "all 8 carry title, readOnlyHint, outputSchema"
+        if not missing
+        else f"missing: {missing}",
+    )
+except Exception as e:
+    tools_by_name = {}
+    check("tools/list metadata (title + readOnlyHint + outputSchema)", False, repr(e))
+
+try:
+    err = rpc("resources/list").get("error", {})
+    check("unknown method -> -32601", err.get("code") == -32601, str(err)[:70])
+except Exception as e:
+    check("unknown method -> -32601", False, repr(e))
+
+try:
+    err = rpc("tools/call", {"name": "arcgis__nope", "arguments": {}}).get("error", {})
+    ok = (
+        err.get("code") == -32602
+        and err.get("message", "").startswith("Unknown tool")
+        and "arcgis__query_data" in json.dumps(err.get("data"))
+    )
+    check("unknown tool -> -32602 + available tools", ok, str(err)[:70])
+except Exception as e:
+    check("unknown tool -> -32602 + available tools", False, repr(e))
+
+try:
+    err = rpc("tools/call", {"name": "arcgis__get_dataset", "arguments": "x"}).get(
+        "error", {}
+    )
+    check("non-object arguments -> -32602", err.get("code") == -32602, str(err)[:70])
+except Exception as e:
+    check("non-object arguments -> -32602", False, repr(e))
+
+try:
+    r = call_tool("query_data", {"dataset_id": parcels_id or "x", "limit": "many"})
+    res = r.get("result", {})
+    ok = res.get("isError") is True and "limit must be an integer" in text_of(r)
+    check("bad tool argument -> isError with message", ok, text_of(r)[:60])
+except Exception as e:
+    check("bad tool argument -> isError with message", False, repr(e))
+
+try:
+    status, _, body = raw(
+        payload=jsonrpc("ping"), headers={"Origin": "https://evil.example"}
+    )
+    ok = status == 403 and (body or {}).get("error", {}).get("code") == -32600
+    check("disallowed Origin -> 403", ok, f"HTTP {status} {str(body)[:50]}")
+except Exception as e:
+    check("disallowed Origin -> 403", False, repr(e))
+
+try:
+    status, hdrs, _ = raw(
+        payload=jsonrpc("ping"), headers={"Origin": "https://claude.ai"}
+    )
+    ok = (
+        status == 200 and hdrs.get("access-control-allow-origin") == "https://claude.ai"
+    )
+    check("allowlisted Origin -> 200 + reflected", ok, f"HTTP {status}")
+except Exception as e:
+    check("allowlisted Origin -> 200 + reflected", False, repr(e))
+
+try:
+    status, _, body = raw(
+        payload=jsonrpc("ping"), headers={"MCP-Protocol-Version": "1999-01-01"}
+    )
+    err = (body or {}).get("error", {})
+    ok = (
+        status == 400
+        and err.get("code") == -32600
+        and "2025-11-25" in (err.get("data") or {}).get("supported", [])
+    )
+    check(
+        "bad MCP-Protocol-Version -> 400/-32600", ok, f"HTTP {status} {str(err)[:50]}"
+    )
+except Exception as e:
+    check("bad MCP-Protocol-Version -> 400/-32600", False, repr(e))
+
+try:
+    status, _, body = raw(
+        payload=jsonrpc("ping"), headers={"MCP-Protocol-Version": "2025-06-18"}
+    )
+    check(
+        "good MCP-Protocol-Version -> 200",
+        status == 200 and (body or {}).get("result") == {},
+        f"HTTP {status}",
+    )
+except Exception as e:
+    check("good MCP-Protocol-Version -> 200", False, repr(e))
+
+try:
+    status, hdrs, _ = raw(method="OPTIONS", headers={"Origin": "https://claude.ai"})
+    allowed = hdrs.get("access-control-allow-headers", "").lower()
+    ok = (
+        status == 200
+        and "mcp-protocol-version" in allowed
+        and "mcp-session-id" in allowed
+    )
+    check("OPTIONS preflight allows MCP headers", ok, f"HTTP {status} {allowed[:50]}")
+except Exception as e:
+    check("OPTIONS preflight allows MCP headers", False, repr(e))
+
+try:
+    a = rpc("tools/list")["result"]["tools"]
+    b = rpc("tools/list")["result"]["tools"]
+    check("tools/list is deterministic", a == b, f"{len(a)} tools")
+except Exception as e:
+    check("tools/list is deterministic", False, repr(e))
+
+
+# ── Structured output (outputSchema is BINDING) ───────────────────────
+# Validate LIVE structuredContent against the outputSchema the server
+# itself advertises, across awkward branches, and assert every structured
+# caveat appears verbatim in the prose.
+
+
+def check_structured(label, tool, args, expect_codes=None):
+    try:
+        r = call_tool(tool, args)
+        res = r["result"]
+        sc = res.get("structuredContent")
+        schema = tools_by_name.get(f"arcgis__{tool}", {}).get("outputSchema")
+        problems = []
+        if not sc:
+            problems.append("no structuredContent")
+        if not schema:
+            problems.append("no outputSchema advertised")
+        if sc and schema:
+            if Draft202012Validator is not None:
+                errs = list(Draft202012Validator(schema).iter_errors(sc))
+                problems += [f"schema: {e.message}" for e in errs[:3]]
+            else:
+                missing = [k for k in schema.get("required", []) if k not in sc]
+                if missing:
+                    problems.append(f"missing keys {missing}")
+            text = res["content"][0]["text"]
+            for c in sc.get("caveats", []):
+                if c["message"] not in text:
+                    problems.append(f"caveat {c['code']} absent from prose")
+            got = [c["code"] for c in sc.get("caveats", [])]
+            for code in expect_codes or []:
+                if code not in got:
+                    problems.append(f"expected caveat {code}, got {got}")
+        detail = (
+            "; ".join(problems)
+            if problems
+            else f"caveats={[c['code'] for c in sc.get('caveats', [])]}"
+        )
+        check(label, not problems, detail)
+    except Exception as e:
+        check(label, False, repr(e))
+
+
+check_structured(
+    "structured: search_datasets hit",
+    "search_datasets",
+    {"q": "parcels", "type": "Feature Service", "limit": 5},
+)
+check_structured(
+    "structured: search_datasets empty",
+    "search_datasets",
+    {"q": "qwzxjvplk"},
+    expect_codes=["no_results"],
+)
+check_structured("structured: get_aggregations", "get_aggregations", {"field": "type"})
+check_structured(
+    "structured: geocode_address",
+    "geocode_address",
+    {"address": "202 C St, San Diego, CA"},
+)
+if parcels_id:
+    check_structured(
+        "structured: get_dataset", "get_dataset", {"dataset_id": parcels_id}
+    )
+    check_structured(
+        "structured: query_data truncated",
+        "query_data",
+        {"dataset_id": parcels_id, "where": "1=1", "limit": 1},
+        expect_codes=["results_truncated"],
+    )
+    check_structured(
+        "structured: get_layer_schema",
+        "get_layer_schema",
+        {"item_id": parcels_id, "keyword": "situs"},
+    )
+    check_structured(
+        "structured: get_distinct_values",
+        "get_distinct_values",
+        {"item_id": parcels_id, "field": "situs_juris", "limit": 5},
+        expect_codes=["results_truncated"],
+    )
+    check_structured(
+        "structured: spatial_query_point by address",
+        "spatial_query_point",
+        {"item_id": parcels_id, "address": "202 C St, San Diego, CA", "limit": 2},
+        expect_codes=["geocoded"],
+    )
 
 print("\n=== SUMMARY ===")
 n_pass = sum(results)

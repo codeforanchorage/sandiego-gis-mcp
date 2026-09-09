@@ -24,6 +24,8 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
+    # Validates tool output against each declared MCP outputSchema
+    "jsonschema>=4.0.0",
     # PINNED, not floating: a floating `ruff>=0.1.0` lets CI resolve to
     # whatever ruff released most recently and check rules this tree has
     # never been run against. Keep this equal to the rev in
