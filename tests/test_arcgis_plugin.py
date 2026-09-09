@@ -483,6 +483,18 @@ class TestSchemaDistinctSpatial:
         assert params["inSR"] == 4326
 
     @pytest.mark.asyncio
+    async def test_spatial_query_point_distance_adds_buffer_params(self, arcgis_config):
+        plugin, mock_client = self._plugin(
+            arcgis_config, query_payload={"features": []}
+        )
+        await plugin.spatial_query_point("abc", -117.16, 32.72, distance_m=10)
+        params = mock_client.get.call_args.kwargs["params"]
+        assert params["distance"] == 10
+        assert params["units"] == "esriSRUnit_Meter"
+        await plugin.spatial_query_point("abc", -117.16, 32.72)
+        assert "distance" not in mock_client.get.call_args.kwargs["params"]
+
+    @pytest.mark.asyncio
     async def test_spatial_query_point_rejects_bad_coords(self, arcgis_config):
         plugin, _ = self._plugin(arcgis_config)
         with pytest.raises(ValueError, match="lon"):
@@ -780,6 +792,58 @@ class TestGeocoding:
         assert mock_spatial.call_args[0][2] == 42.26
         assert "Geocoded" in result.content[0]["text"]
         assert "WARD" in result.content[0]["text"]
+        # Point hit a polygon: no snap retry.
+        assert mock_spatial.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_spatial_query_point_address_miss_retries_within_snap_radius(
+        self, arcgis_config
+    ):
+        """A geocoded point in the street right-of-way hits no parcel; the
+        tool retries once within the snap radius and says so."""
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        with (
+            patch.object(
+                plugin,
+                "geocode_address",
+                new_callable=AsyncMock,
+                return_value=[
+                    {"matched_address": "202 C ST", "lon": -117.1628, "lat": 32.7168}
+                ],
+            ),
+            patch.object(
+                plugin,
+                "spatial_query_point",
+                new_callable=AsyncMock,
+                side_effect=[[], [{"apn": "7602136109"}]],
+            ) as mock_spatial,
+        ):
+            result = await plugin.execute_tool(
+                "spatial_query_point", {"item_id": "abc", "address": "202 C St"}
+            )
+        assert result.success is True
+        assert mock_spatial.call_count == 2
+        assert "distance_m" not in mock_spatial.call_args_list[0].kwargs
+        assert mock_spatial.call_args_list[1].kwargs["distance_m"] == 10
+        text = result.content[0]["text"]
+        assert "within 10 m" in text
+        assert "7602136109" in text
+
+    @pytest.mark.asyncio
+    async def test_spatial_query_point_lonlat_miss_does_not_retry(self, arcgis_config):
+        """Explicit coordinates are taken at face value: no snap retry."""
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        with patch.object(
+            plugin, "spatial_query_point", new_callable=AsyncMock, return_value=[]
+        ) as mock_spatial:
+            result = await plugin.execute_tool(
+                "spatial_query_point", {"item_id": "abc", "lon": -117.16, "lat": 32.72}
+            )
+        assert result.success is True
+        assert mock_spatial.call_count == 1
+        assert "No records returned" in result.content[0]["text"]
 
     @pytest.mark.asyncio
     async def test_spatial_query_point_unresolvable_address(self, arcgis_config):

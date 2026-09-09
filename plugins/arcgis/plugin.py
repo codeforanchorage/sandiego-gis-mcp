@@ -100,6 +100,12 @@ class ArcGISPlugin(DataPlugin):
     # doesn't re-fetch every folder.
     _DIRECTORY_CACHE_TTL = 300.0
 
+    # Retry radius for address-form spatial_query_point when the geocoded
+    # point hits nothing. Verified against SANDAG parcels at City Hall: 10 m
+    # recovers the named parcel from a street-centerline geocode, 20 m
+    # already pulls in unrelated lots across the block.
+    _ADDRESS_SNAP_METERS = 10
+
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__(config)
         self.plugin_config: Optional[ArcGISPluginConfig] = None
@@ -691,6 +697,27 @@ class ArcGISPlugin(DataPlugin):
                     arguments.get("out_fields", "*"),
                     limit,
                 )
+                if not records and geocoded_note:
+                    # Geocoders place addresses on the street centerline, so
+                    # the point can fall in the right-of-way just outside the
+                    # parcel it names. Retry once within a few meters; the
+                    # note keeps the caller honest about what was matched.
+                    records = await self.spatial_query_point(
+                        item_id,
+                        lon,
+                        lat,
+                        arguments.get("where", "1=1"),
+                        arguments.get("out_fields", "*"),
+                        limit,
+                        distance_m=self._ADDRESS_SNAP_METERS,
+                    )
+                    if records:
+                        geocoded_note += (
+                            f"No feature contains the geocoded point exactly; "
+                            f"showing features within {self._ADDRESS_SNAP_METERS} m "
+                            f"of it (geocoders place addresses on the street "
+                            f"centerline).\n\n"
+                        )
                 return ToolResult(
                     content=[
                         {
@@ -1263,7 +1290,10 @@ class ArcGISPlugin(DataPlugin):
         where: str = "1=1",
         out_fields: str = "*",
         limit: int = 10,
+        distance_m: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
+        """Features intersecting a WGS84 point. With `distance_m`, features
+        within that many meters of the point instead (server-side buffer)."""
         if not -180 <= lon <= 180:
             raise ValueError(f"lon must be between -180 and 180 (got {lon})")
         if not -90 <= lat <= 90:
@@ -1282,6 +1312,9 @@ class ArcGISPlugin(DataPlugin):
             "resultRecordCount": min(max(limit, 1), 50),
             "f": "json",
         }
+        if distance_m:
+            params["distance"] = distance_m
+            params["units"] = "esriSRUnit_Meter"
         data = await self._query_layer(layer_url, params)
         return [f.get("attributes", {}) for f in data.get("features", [])]
 
