@@ -86,7 +86,14 @@ plugins:
     enabled: true # Set to true to use
     portal_url: "https://geo.sandag.org/portal"
     services_url: "https://geo.sandag.org/server/rest/services"
-    geocoder_url: "https://gis.sandag.org/sdgis/rest/services/SANDAG_COMPOSITE_LOCATOR/GeocodeServer"
+    # geocoder_url is intentionally unset: gis.sandag.org re-issued its
+    # certificate on 2026-07-08 under a GoDaddy chain that certifi (Mozilla
+    # roots) cannot verify, so every geocode through the SANDAG composite
+    # locator failed with CERTIFICATE_VERIFY_FAILED. The copy of the locator
+    # on geo.sandag.org verifies but has no city names in its reference data
+    # ('202 C St, San Diego' -> Oceanside). Until the chain is fixed, the US
+    # Census geocoder fallback below is used (biased by geocoder_region).
+    # geocoder_url: "https://gis.sandag.org/sdgis/rest/services/SANDAG_COMPOSITE_LOCATOR/GeocodeServer"
     city_name: "the San Diego region"
     scope_note: >-
       This is the SANDAG/SanGIS REGIONAL catalog. Authoritative City of San
