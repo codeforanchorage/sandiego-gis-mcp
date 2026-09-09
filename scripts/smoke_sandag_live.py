@@ -76,17 +76,21 @@ try:
 except Exception as e:
     check("Hosted/ folder public", False, repr(e))
 
-# 3. auth-gated folder shape -- GeoDepot must answer with a JSON error body
-#    (ArcGIS Enterprise returns HTTP 200 + {"error":{"code":499,...}}), which
-#    is the shape discovery has to detect and skip.
+# 3. auth-gated folder shape -- at least one folder must answer with a JSON
+#    error body (ArcGIS Enterprise returns HTTP 200 + {"error":{"code":499,...}}),
+#    which is the shape discovery has to detect and skip. Which folder is
+#    gated changes over time (GeoDepot was, Digital_Infrastructure is as of
+#    2026-09), so discover it rather than hardcode it.
 try:
-    gated = get_json(f"{SERVICES_ROOT}/GeoDepot", {"f": "json"})
-    err = gated.get("error", {})
-    ok = err.get("code") in (499, 498, 403, 401)
+    gated_folders = {}
+    for folder in root.get("folders", []):
+        err = get_json(f"{SERVICES_ROOT}/{folder}", {"f": "json"}).get("error", {})
+        if err.get("code") in (499, 498, 403, 401):
+            gated_folders[folder] = err.get("code")
     check(
         "auth-gated folder returns token error",
-        ok,
-        f"code={err.get('code')} message={err.get('message')!r}",
+        bool(gated_folders),
+        f"gated={gated_folders}",
     )
 except Exception as e:
     check("auth-gated folder returns token error", False, repr(e))

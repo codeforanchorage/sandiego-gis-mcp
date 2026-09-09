@@ -831,7 +831,7 @@ class ArcGISPlugin(DataPlugin):
                 continue
             err = fdata.get("error")
             if err:
-                # Auth-gated folders (e.g. GeoDepot) answer HTTP 200 with a
+                # Auth-gated folders (e.g. Digital_Infrastructure) answer HTTP 200 with a
                 # "Token Required" error body -- skip them, don't fail.
                 level = (
                     logger.info

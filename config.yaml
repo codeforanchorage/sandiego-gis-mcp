@@ -51,8 +51,7 @@ instructions: |
     attribution with any figures or records you report.
   - An empty result means no records matched the filter, not that the layer
     or the feature is missing: re-check the schema and distinct values.
-  - Some catalog folders (e.g. GeoDepot) are sign-in only and are not
-    searchable here.
+  - A few catalog folders are sign-in only and are not searchable here.
 
   Scope: this server is the REGIONAL catalog only. Authoritative City of San
   Diego municipal layers (MHPA, City base zoning, community-plan land use)

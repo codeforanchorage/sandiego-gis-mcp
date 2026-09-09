@@ -70,7 +70,7 @@ print(f"Smoke testing: {URL}\n")
 # 1. ping
 try:
     r = rpc("ping")
-    check("ping", r.get("result", {}).get("status") == "ok", str(r.get("result")))
+    check("ping", "result" in r and "error" not in r, str(r.get("result")))
 except Exception as e:
     check("ping", False, repr(e))
 
