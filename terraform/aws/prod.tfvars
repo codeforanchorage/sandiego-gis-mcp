@@ -1,7 +1,7 @@
-lambda_name     = "sandiego-gis-mcp-prod"
-stage_name      = "prod"
-aws_region      = "us-west-2"
-config_file     = "config.yaml"
+lambda_name = "sandiego-gis-mcp-prod"
+stage_name  = "prod"
+aws_region  = "us-west-2"
+config_file = "config.yaml"
 # NOTE: lambda_memory and lambda_timeout here are OVERRIDDEN by the aws:
 # block in config.yaml (see terraform/aws/main.tf locals) -- they are kept
 # in sync so this file is not misleading, but config.yaml is the file to
