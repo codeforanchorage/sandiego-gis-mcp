@@ -135,6 +135,17 @@ class TestGetTools:
             "geocode_address",
         }
 
+    def test_every_tool_is_read_only_with_a_display_title(self, arcgis_config):
+        """All tools are read-only queries against a public external
+        service, and each carries a human-readable title for tool pickers."""
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+
+        for tool in plugin.get_tools():
+            assert tool.annotations == {"readOnlyHint": True, "openWorldHint": True}
+            assert tool.title, f"{tool.name} has no title"
+            assert tool.title != tool.name
+
 
 # ── execute_tool ───────────────────────────────────────────────────────
 

@@ -198,7 +198,35 @@ class ArcGISPlugin(DataPlugin):
         self._initialized = False
         logger.info("ArcGIS plugin shut down")
 
+    # Human-readable display names. The wire `name` is prefixed
+    # (`arcgis__query_data`) because it must be a stable, collision-free
+    # identifier; that string reads poorly in a client's tool picker.
+    # Clients resolve display names as title -> annotations.title -> name.
+    # Keyed by the UNPREFIXED tool name.
+    TOOL_TITLES = {
+        "search_datasets": "Search Datasets",
+        "get_dataset": "Dataset Details",
+        "get_aggregations": "Catalog Facets",
+        "query_data": "Query Data",
+        "get_layer_schema": "Layer Schema",
+        "get_distinct_values": "Distinct Values",
+        "spatial_query_point": "What's at This Point",
+        "geocode_address": "Geocode Address",
+    }
+
+    # Every tool here is a read-only query against a public, external
+    # ArcGIS service: safe to call without confirmation, and results may
+    # change between calls as SanGIS republishes layers.
+    TOOL_ANNOTATIONS = {"readOnlyHint": True, "openWorldHint": True}
+
     def get_tools(self) -> List[ToolDefinition]:
+        tools = self._tool_definitions()
+        for tool in tools:
+            tool.title = self.TOOL_TITLES.get(tool.name)
+            tool.annotations = dict(self.TOOL_ANNOTATIONS)
+        return tools
+
+    def _tool_definitions(self) -> List[ToolDefinition]:
         city = self.plugin_config.city_name if self.plugin_config else "Unknown"
         scope_note = (self.plugin_config.scope_note if self.plugin_config else "") or ""
         search_description = (
@@ -337,7 +365,7 @@ class ArcGISPlugin(DataPlugin):
                 description=(
                     "List a dataset's fields (name, type, alias, coded values) "
                     "so you can write a correct query_data WHERE clause without "
-                    "guessing. Field names are CASE-SENSITIVE. Pass a Hub item "
+                    "guessing. Field names are CASE-SENSITIVE. Pass a dataset "
                     "ID; optional `keyword` shows only matching fields. Typical "
                     "chain: search_datasets -> get_layer_schema -> query_data."
                 ),

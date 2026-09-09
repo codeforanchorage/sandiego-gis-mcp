@@ -331,6 +331,33 @@ class TestToolRegistration:
             assert all_tools[0]["name"] == "ckan__search_datasets"
             assert all_tools[0]["description"] == "Search datasets"
             assert all_tools[0]["inputSchema"] == {"type": "object"}
+            # No title/annotations declared -> keys omitted entirely, so
+            # clients' title -> annotations.title -> name fallback works.
+            assert "title" not in all_tools[0]
+            assert "annotations" not in all_tools[0]
+
+    def test_get_all_tools_emits_title_and_annotations(self):
+        """`title` is a top-level Tool field (not an annotation) and
+        annotations pass through; the wire name stays prefixed."""
+        manager = PluginManager({"plugins": {}})
+        plugin = MagicMock()
+        plugin.get_tools.return_value = [
+            ToolDefinition(
+                name="t",
+                title="Nice Name",
+                description="d",
+                input_schema={"type": "object"},
+                annotations={"readOnlyHint": True},
+            )
+        ]
+        manager.plugins = {"ckan": plugin}
+
+        tool = manager.get_all_tools()[0]
+
+        assert tool["name"] == "ckan__t"
+        assert tool["title"] == "Nice Name"
+        assert tool["annotations"] == {"readOnlyHint": True}
+        assert "title" not in tool["annotations"]
 
 
 class TestToolExecution:

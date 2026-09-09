@@ -277,13 +277,19 @@ class PluginManager:
             for tool_def in plugin_tools:
                 # Use double underscore separator to match _register_tools
                 prefixed_name = f"{plugin_name}__{tool_def.name}"
-                tools.append(
-                    {
-                        "name": prefixed_name,
-                        "description": tool_def.description,
-                        "inputSchema": tool_def.input_schema,
-                    }
-                )
+                tool_dict: Dict[str, Any] = {
+                    "name": prefixed_name,
+                    "description": tool_def.description,
+                    "inputSchema": tool_def.input_schema,
+                }
+                # `title` is a top-level Tool field, not an annotation. It is
+                # the display name clients prefer over the prefixed `name`,
+                # which is an identifier and reads poorly in a picker.
+                if tool_def.title:
+                    tool_dict["title"] = tool_def.title
+                if tool_def.annotations:
+                    tool_dict["annotations"] = tool_def.annotations
+                tools.append(tool_dict)
 
         return tools
 
