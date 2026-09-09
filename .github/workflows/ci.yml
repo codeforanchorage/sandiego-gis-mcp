@@ -83,6 +83,22 @@ jobs:
       # scripts/smoke_*.py and are run by hand, so CI is never gated on a
       # third party being up. Coverage omissions (inert plugins, the legacy
       # Lambda entry point) are listed in pyproject.toml [tool.coverage.run].
+      # API Gateway enforces a hard 29s integration timeout; the plugin's
+      # HTTP timeout must sit under the Lambda's so a hung upstream returns
+      # a readable tool error instead of the Lambda being killed mid-flight.
+      - name: Validate config and timeout ladder
+        run: |
+          python -c "
+          from core.validators import load_and_validate_config, get_enabled_plugin_config
+          config = load_and_validate_config('config.yaml')
+          name, plugin = get_enabled_plugin_config(config)
+          lambda_timeout = config['aws']['lambda_timeout']
+          plugin_timeout = plugin['timeout']
+          print(f'plugin={name} plugin_timeout={plugin_timeout}s lambda={lambda_timeout}s')
+          assert lambda_timeout < 29, f'lambda_timeout {lambda_timeout} >= API Gateway 29s ceiling'
+          assert plugin_timeout < lambda_timeout, f'plugin timeout {plugin_timeout} >= lambda {lambda_timeout}'
+          "
+
       - name: pytest with coverage
         run: |
           pytest tests/ -n auto \

@@ -18,7 +18,7 @@ description: >-
 organization: "SANDAG/SanGIS"
 # Surfaced in the MCP `initialize` response as serverInfo.version. Bump it
 # with any behaviour change worth telling a client apart by.
-server_version: "1.1.0"
+server_version: "1.2.0"
 
 # Per-deployment guidance returned in the MCP `initialize` response as
 # `instructions`. Model-agnostic: clients prepend it to the model's context
@@ -99,10 +99,13 @@ plugins:
       Diego municipal layers (MHPA, City base zoning, community-plan land
       use) are NOT here -- they live on the separate 'San Diego City' MCP
       server; use that server for City municipal questions.
-    # 25s, not 120: API Gateway hard-caps responses at 29s, so an upstream
-    # timeout must fire BEFORE that to reach the client as a clean JSON-RPC
-    # error instead of an opaque 504. Normal SANDAG queries finish in <5s.
-    timeout: 25
+    # HTTP timeout to ArcGIS, per request. The ladder is API Gateway 29s
+    # (hard, non-adjustable) > Lambda 28s (aws.lambda_timeout below) > this,
+    # so a hung upstream surfaces as a readable tool error instead of the
+    # Lambda being killed mid-flight. 60 days of prod CloudWatch (715
+    # invocations) show a max duration of 2.4s, so 20s clears every
+    # observed request with a wide margin.
+    timeout: 20
     geocoder_region: "San Diego, CA" # biases the US Census fallback geocoder
     # token: "${ARCGIS_TOKEN}"  # Optional: Bearer token for private items
 
@@ -111,7 +114,10 @@ aws:
   region: "us-west-2" # AWS region for Lambda
   lambda_name: "sandiego-gis-mcp" # Lambda function name
   lambda_memory: 512 # Lambda memory in MB (128-10240)
-  lambda_timeout: 120 # Lambda timeout in seconds (max 900)
+  # 28s: just under REST API Gateway's hard 29s integration timeout. Anything
+  # longer only burns billed compute and a reserved-concurrency slot after
+  # the client already has its 504. This value WINS over prod.tfvars.
+  lambda_timeout: 28
 
 # Logging configuration
 logging:
