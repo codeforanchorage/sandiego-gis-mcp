@@ -1,9 +1,9 @@
-lambda_name = "sandiego-gis-mcp-prod"
-stage_name  = "prod"
-aws_region  = "us-west-2"
-config_file = "config.yaml"
-lambda_memory  = 512
-lambda_timeout = 120
+lambda_name     = "sandiego-gis-mcp-prod"
+stage_name      = "prod"
+aws_region      = "us-west-2"
+config_file     = "config.yaml"
+lambda_memory   = 512
+lambda_timeout  = 120
 api_quota_limit = 3000
 api_rate_limit  = 5
 api_burst_limit = 10
