@@ -626,6 +626,10 @@ class ArcGISPlugin(DataPlugin):
         )
         self._directory_cache: List[Dict[str, Any]] = []
         self._directory_cache_expiry: float = 0.0
+        # When the next portal re-probe is due while in directory mode.
+        # Armed by initialize(); "never" until then, so a plugin wired up
+        # directly in tests stays in whatever mode it was given.
+        self._portal_reprobe_at: float = float("inf")
 
     async def initialize(self) -> bool:
         try:
@@ -650,6 +654,7 @@ class ArcGISPlugin(DataPlugin):
             )
 
             self._search_mode = await self._probe_search_mode()
+            self._portal_reprobe_at = time.monotonic() + self._DIRECTORY_CACHE_TTL
 
             self._initialized = True
             logger.info(
@@ -1736,8 +1741,28 @@ class ArcGISPlugin(DataPlugin):
         self, query: str, limit: int, item_type: Optional[str]
     ) -> List[Dict[str, Any]]:
         if self._search_mode == "directory":
+            await self._maybe_recover_portal()
+        if self._search_mode == "directory":
             return await self._search_directory(query, limit, item_type)
         return await self._search_portal(query, limit, item_type)
+
+    async def _maybe_recover_portal(self) -> None:
+        """Re-probe the portal once per directory-cache TTL while in
+        directory mode. Discovery mode is chosen once at initialize(), so
+        a Lambda instance that cold-started during a portal outage would
+        otherwise stay on the name-only directory walk for its whole life."""
+        now = time.monotonic()
+        if not self.portal_client or now < self._portal_reprobe_at:
+            return
+        self._portal_reprobe_at = now + self._DIRECTORY_CACHE_TTL
+        try:
+            mode = await self._probe_search_mode()
+        except Exception as e:
+            logger.info(f"Portal re-probe failed; staying in directory mode: {e}")
+            return
+        if mode == "portal":
+            logger.info("Portal search is answering again; leaving directory mode")
+            self._search_mode = "portal"
 
     async def _search_portal(
         self, query: str, limit: int, item_type: Optional[str]

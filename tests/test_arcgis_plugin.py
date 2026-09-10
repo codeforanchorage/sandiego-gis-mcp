@@ -463,6 +463,44 @@ class TestDirectorySearch:
         assert results[0]["title"] == "Parcels"
 
     @pytest.mark.asyncio
+    async def test_directory_mode_recovers_when_portal_returns(self, arcgis_config):
+        plugin, mock_client = self._plugin(
+            arcgis_config, [self._ROOT, self._HOSTED, self._GATED]
+        )
+        portal = AsyncMock()
+        portal.get = AsyncMock(
+            side_effect=[
+                _resp({"error": {"code": 499, "message": "Token Required"}}),
+                _resp({"results": [{"id": "a" * 32, "title": "Parcels"}]}),
+                _resp({"results": [{"id": "a" * 32, "title": "Parcels"}]}),
+            ]
+        )
+        plugin.portal_client = portal
+
+        # Not armed: a plugin wired up without initialize() never re-probes.
+        await plugin.search_datasets("parcels", 10)
+        portal.get.assert_not_called()
+
+        # Due, but the portal is still gated: stay in directory mode and
+        # do not probe again until the next TTL.
+        plugin._portal_reprobe_at = 0.0
+        results = await plugin.search_datasets("parcels", 10)
+        assert plugin._search_mode == "directory"
+        assert results[0]["id"] == "Hosted/Parcels/FeatureServer"
+        assert portal.get.call_count == 1
+        assert plugin._portal_reprobe_at > time.monotonic()
+        await plugin.search_datasets("parcels", 10)
+        assert portal.get.call_count == 1
+
+        # Due again and the portal answers: switch, and this search already
+        # goes to the portal.
+        plugin._portal_reprobe_at = 0.0
+        results = await plugin.search_datasets("parcels", 10)
+        assert plugin._search_mode == "portal"
+        assert results[0]["id"] == "a" * 32
+        assert portal.get.call_count == 3
+
+    @pytest.mark.asyncio
     async def test_directory_listing_is_cached(self, arcgis_config):
         plugin, mock_client = self._plugin(
             arcgis_config, [self._ROOT, self._HOSTED, self._GATED]
