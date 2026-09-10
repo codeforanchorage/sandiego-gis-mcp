@@ -132,6 +132,7 @@ class TestGetTools:
             "get_layer_schema",
             "get_distinct_values",
             "spatial_query_point",
+            "spatial_query_polygon",
             "geocode_address",
         }
 
@@ -1474,3 +1475,122 @@ class TestArcGISGeocoder:
         )
         with pytest.raises(RuntimeError, match="bad address"):
             await plugin.geocode_address("202 C St")
+
+
+# ── spatial_query_polygon helpers ──────────────────────────────────────
+
+
+def _ring_area(ring):
+    """Shoelace area of a closed ring (absolute value)."""
+    return abs(
+        sum(
+            ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]
+            for i in range(len(ring) - 1)
+        )
+        / 2
+    )
+
+
+class TestPolygonHelpers:
+    SQUARE = [[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]
+
+    def test_geojson_polygon_and_wrapped_multipolygon(self):
+        esri = ArcGISPlugin._geojson_to_esri_polygon(
+            {"type": "Polygon", "coordinates": [self.SQUARE]}
+        )
+        assert esri == {"rings": [self.SQUARE], "spatialReference": {"wkid": 4326}}
+        feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "MultiPolygon",
+                "coordinates": [[self.SQUARE], [self.SQUARE, self.SQUARE]],
+            },
+        }
+        assert len(ArcGISPlugin._geojson_to_esri_polygon(feature)["rings"]) == 3
+
+    def test_geojson_rejects_non_polygons(self):
+        with pytest.raises(ValueError, match="Polygon, MultiPolygon"):
+            ArcGISPlugin._geojson_to_esri_polygon(
+                {"type": "Point", "coordinates": [0, 0]}
+            )
+        with pytest.raises(ValueError, match="GeoJSON object"):
+            ArcGISPlugin._geojson_to_esri_polygon("not a dict")
+        with pytest.raises(ValueError, match="no polygon rings"):
+            ArcGISPlugin._geojson_to_esri_polygon(
+                {"type": "Polygon", "coordinates": []}
+            )
+
+    def test_geojson_caps_are_enforced(self, monkeypatch):
+        monkeypatch.setattr(ArcGISPlugin, "MAX_FILTER_COORDS", 4)
+        with pytest.raises(ValueError, match="coordinates; max is 4"):
+            ArcGISPlugin._geojson_to_esri_polygon(
+                {"type": "Polygon", "coordinates": [self.SQUARE]}
+            )
+        monkeypatch.setattr(ArcGISPlugin, "MAX_FILTER_RINGS", 1)
+        with pytest.raises(ValueError, match="rings; max is 1"):
+            ArcGISPlugin._geojson_to_esri_polygon(
+                {"type": "Polygon", "coordinates": [self.SQUARE, self.SQUARE]}
+            )
+
+    def test_union_merges_overlapping_squares(self):
+        a = [[0, 0], [0, 2], [2, 2], [2, 0], [0, 0]]
+        b = [[1, 1], [1, 3], [3, 3], [3, 1], [1, 1]]
+        merged = ArcGISPlugin._union_esri_rings([a, b])
+        assert merged is not None and len(merged) == 1
+        assert merged[0][0] == merged[0][-1], "ring must be closed"
+        # 4 + 4 - 1 overlap: a concatenation would have kept two rings and
+        # the even-odd rule would have cut the overlap out.
+        assert _ring_area(merged[0]) == pytest.approx(7.0)
+
+    def test_union_keeps_disjoint_rings_apart(self):
+        a = [[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]
+        b = [[5, 5], [5, 6], [6, 6], [6, 5], [5, 5]]
+        merged = ArcGISPlugin._union_esri_rings([a, b])
+        assert merged is not None and len(merged) == 2
+
+    def test_union_returns_none_for_degenerate_input(self):
+        assert ArcGISPlugin._union_esri_rings([]) is None
+        assert ArcGISPlugin._union_esri_rings([[[0, 0], [1, 1]]]) is None
+        assert ArcGISPlugin._union_esri_rings(["garbage"]) is None
+
+    def test_fit_to_budget_passes_small_filters_untouched(self):
+        rings, tol = ArcGISPlugin._fit_filter_to_budget([self.SQUARE])
+        assert rings == [self.SQUARE] and tol is None
+
+    def test_fit_to_budget_refuses_when_nothing_fits(self, monkeypatch):
+        monkeypatch.setattr(ArcGISPlugin, "MAX_FILTER_BYTES", 10)
+        with pytest.raises(ValueError, match="too large to send even after"):
+            ArcGISPlugin._fit_filter_to_budget([self.SQUARE])
+
+    def test_serialize_rounds_to_six_decimals(self):
+        out = ArcGISPlugin._serialize_rings([[[-117.123456789, 32.987654321]] * 4])
+        assert "-117.123457" in out and "32.987654" in out
+        assert "123456789" not in out
+
+    def test_normalize_linear_unit(self):
+        assert ArcGISPlugin._normalize_linear_unit(None) == "meters"
+        assert ArcGISPlugin._normalize_linear_unit(" MI ") == "miles"
+        assert ArcGISPlugin._normalize_linear_unit("ft") == "feet"
+        with pytest.raises(ValueError, match="not a supported linear unit"):
+            ArcGISPlugin._normalize_linear_unit("furlongs")
+
+    @pytest.mark.asyncio
+    async def test_spatial_query_polygon_validates_before_any_request(
+        self, arcgis_config
+    ):
+        plugin = ArcGISPlugin(arcgis_config)
+        plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
+        plugin.feature_client = AsyncMock()
+        square = {"type": "Polygon", "coordinates": [self.SQUARE]}
+        with pytest.raises(ValueError, match="spatial_rel must be one of"):
+            await plugin.spatial_query_polygon(
+                "abc", filter_geometry=square, spatial_rel="near"
+            )
+        with pytest.raises(ValueError, match="distance must be >= 0"):
+            await plugin.spatial_query_polygon(
+                "abc", filter_geometry=square, distance=-1
+            )
+        with pytest.raises(ValueError, match="filter_geometry"):
+            await plugin.spatial_query_polygon("abc")
+        plugin.feature_client.get.assert_not_called()
+        plugin.feature_client.post.assert_not_called()

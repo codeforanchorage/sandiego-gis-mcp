@@ -11,6 +11,7 @@ no traceback; genuine upstream faults must keep theirs.
 """
 
 import ast
+import json
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -170,6 +171,7 @@ class TestOutputSchemaDeclarations:
         "get_layer_schema": "fields",
         "get_distinct_values": "values",
         "spatial_query_point": "rows",
+        "spatial_query_polygon": "rows",
         "geocode_address": "candidates",
     }
 
@@ -605,6 +607,210 @@ class TestGetDistinctValues:
         s = assert_conforms(plugin, "get_distinct_values", result)
         assert s["values"] == []
         assert codes(s) == ["no_results"]
+
+
+FILTER_ID = "ffffffffffffffffffffffffffffffff"
+SQUARE = {
+    "type": "Polygon",
+    "coordinates": [
+        [[-117.2, 32.7], [-117.1, 32.7], [-117.1, 32.8], [-117.2, 32.8], [-117.2, 32.7]]
+    ],
+}
+
+
+def esri_square(x0, y0, x1, y1):
+    """One closed ring in Esri (clockwise, y-up) orientation."""
+    return {"rings": [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]]}
+
+
+class TestSpatialQueryPolygon:
+    @pytest.mark.asyncio
+    async def test_inline_geometry_with_buffer(self, plugin):
+        plugin.feature_client.post = AsyncMock(
+            side_effect=[page([{"name": "Lib A"}]), count(3)]
+        )
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon",
+                {
+                    "item_id": ITEM_ID,
+                    "filter_geometry": SQUARE,
+                    "distance": 1,
+                    "units": "miles",
+                    "limit": 1,
+                },
+            )
+        s = assert_conforms(plugin, "spatial_query_polygon", result)
+        assert s["rows"] == [{"name": "Lib A"}]
+        assert s["summary"]["total_matching"] == 3
+        assert s["summary"]["filter_features"] is None
+        assert s["summary"]["truncated"] is True
+        assert s["summary"]["attribution"] == "SanGIS"
+        assert s["query"]["filter_geometry_type"] == "Polygon"
+        assert s["query"]["filter_where"] is None
+        assert s["query"]["units"] == "miles"
+        assert codes(s) == ["results_truncated"]
+        assert "TOTAL MATCHING: 3" in result.content[0]["text"]
+        # Polygon filters go by POST; the count reuses the same filter.
+        first, second = plugin.feature_client.post.call_args_list
+        body = first.kwargs["data"]
+        assert body["geometryType"] == "esriGeometryPolygon"
+        assert body["spatialRel"] == "esriSpatialRelIntersects"
+        assert body["inSR"] == 4326 and body["outSR"] == 4326
+        assert body["distance"] == 1 and body["units"] == "esriSRUnit_StatuteMile"
+        assert json.loads(body["geometry"])["spatialReference"] == {"wkid": 4326}
+        assert second.kwargs["data"]["returnCountOnly"] == "true"
+        assert second.kwargs["data"]["geometry"] == body["geometry"]
+
+    @pytest.mark.asyncio
+    async def test_filter_layer_unions_its_features(self, plugin):
+        # GET: filter-layer metadata, then the filter-feature count.
+        plugin.feature_client.get = AsyncMock(side_effect=[resp(LAYER_META), count(2)])
+        overlapping = {
+            "features": [
+                {"geometry": esri_square(0, 0, 2, 2)},
+                {"geometry": esri_square(1, 1, 3, 3)},
+            ]
+        }
+        # POST: filter features, then the target query and its count.
+        plugin.feature_client.post = AsyncMock(
+            side_effect=[
+                resp(overlapping),
+                page([{"APN": "1"}, {"APN": "2"}]),
+                count(2),
+            ]
+        )
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon",
+                {
+                    "item_id": ITEM_ID,
+                    "filter_item_id": FILTER_ID,
+                    "filter_where": "district = 1",
+                    "spatial_rel": "within",
+                },
+            )
+        s = assert_conforms(plugin, "spatial_query_polygon", result)
+        assert s["summary"]["filter_features"] == 2
+        assert s["summary"]["total_matching"] == 2
+        assert s["summary"]["truncated"] is False
+        assert s["query"]["filter_where"] == "district = 1"
+        assert s["query"]["filter_geometry_type"] is None
+        assert s["query"]["distance"] is None and s["query"]["units"] is None
+        assert codes(s) == []
+        fetch, target, _ = plugin.feature_client.post.call_args_list
+        assert fetch.kwargs["data"]["returnGeometry"] == "true"
+        assert target.kwargs["data"]["spatialRel"] == "esriSpatialRelWithin"
+        # Two overlapping squares become ONE ring: a real union, not a
+        # concatenation that would punch a hole where they overlap.
+        rings = json.loads(target.kwargs["data"]["geometry"])["rings"]
+        assert len(rings) == 1
+
+    @pytest.mark.asyncio
+    async def test_oversized_filter_is_generalised_with_a_caveat(
+        self, plugin, monkeypatch
+    ):
+        # A square drawn with 200 collinear points per side: every one of
+        # them is redundant, so a 1 m clean collapses it to 4 corners.
+        n = 200
+        dense = [[-117.2 + 0.1 * i / n, 32.7] for i in range(n)]
+        dense += [[-117.1, 32.7 + 0.1 * i / n] for i in range(n)]
+        dense += [[-117.1 - 0.1 * i / n, 32.8] for i in range(n)]
+        dense += [[-117.2, 32.8 - 0.1 * i / n] for i in range(n)]
+        dense.append(dense[0])
+        monkeypatch.setattr(ArcGISPlugin, "MAX_FILTER_BYTES", 2000)
+        plugin.feature_client.post = AsyncMock(
+            side_effect=[page([{"APN": "1"}]), count(1)]
+        )
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon",
+                {
+                    "item_id": ITEM_ID,
+                    "filter_geometry": {"type": "Polygon", "coordinates": [dense]},
+                },
+            )
+        s = assert_conforms(plugin, "spatial_query_polygon", result)
+        assert s["summary"]["filter_simplified_m"] == 1
+        assert codes(s) == ["filter_simplified"]
+        assert "generalised to a 1 m tolerance" in result.content[0]["text"]
+        sent = json.loads(
+            plugin.feature_client.post.call_args_list[0].kwargs["data"]["geometry"]
+        )
+        assert len(sent["rings"][0]) == 5
+        assert len(json.dumps(sent, separators=(",", ":"))) <= 2000
+
+    @pytest.mark.asyncio
+    async def test_empty(self, plugin):
+        plugin.feature_client.post = AsyncMock(side_effect=[page([]), count(0)])
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon", {"item_id": ITEM_ID, "filter_geometry": SQUARE}
+            )
+        s = assert_conforms(plugin, "spatial_query_polygon", result)
+        assert s["rows"] == []
+        assert s["summary"]["total_matching"] == 0
+        assert codes(s) == ["no_results"]
+
+    @pytest.mark.asyncio
+    async def test_count_failure_is_null_not_zero(self, plugin):
+        plugin.feature_client.post = AsyncMock(
+            side_effect=[
+                page([{"APN": "1"}]),
+                resp({"error": {"code": 500, "message": "count exploded"}}),
+            ]
+        )
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon", {"item_id": ITEM_ID, "filter_geometry": SQUARE}
+            )
+        s = assert_conforms(plugin, "spatial_query_polygon", result)
+        assert s["rows"] == [{"APN": "1"}]
+        assert s["summary"]["total_matching"] is None
+        assert s["summary"]["truncated"] is False
+        assert codes(s) == ["count_unavailable"]
+
+    @pytest.mark.asyncio
+    async def test_missing_filter_is_a_caller_error(self, plugin):
+        result = await plugin.execute_tool(
+            "spatial_query_polygon", {"item_id": ITEM_ID}
+        )
+        assert result.success is False
+        assert result.structured_content is None
+        assert "filter_geometry" in result.error_message
+        assert "filter_item_id" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_non_polygon_filter_layer_is_a_caller_error(self, plugin):
+        plugin.feature_client.get = AsyncMock(
+            return_value=resp({**LAYER_META, "geometryType": "esriGeometryPoint"})
+        )
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon",
+                {"item_id": ITEM_ID, "filter_item_id": FILTER_ID},
+            )
+        assert result.success is False
+        assert "polygon layer" in result.error_message
+        plugin.feature_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_over_cap_filter_refuses_loudly(self, plugin):
+        plugin.feature_client.get = AsyncMock(
+            side_effect=[resp(LAYER_META), count(ArcGISPlugin.MAX_FILTER_FEATURES + 1)]
+        )
+        with with_dataset(plugin):
+            result = await plugin.execute_tool(
+                "spatial_query_polygon",
+                {
+                    "item_id": ITEM_ID,
+                    "filter_item_id": FILTER_ID,
+                    "filter_where": "1=1",
+                },
+            )
+        assert result.success is False
+        assert f"max is {ArcGISPlugin.MAX_FILTER_FEATURES:,}" in result.error_message
+        plugin.feature_client.post.assert_not_called()
 
 
 class TestSpatialQueryPoint:

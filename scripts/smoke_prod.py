@@ -137,6 +137,7 @@ try:
         "arcgis__get_layer_schema",
         "arcgis__get_distinct_values",
         "arcgis__spatial_query_point",
+        "arcgis__spatial_query_polygon",
         "arcgis__geocode_address",
     }
     has_all = set(tools) == expected
@@ -146,12 +147,12 @@ try:
         .get("properties", {})
     )
     check(
-        "tools/list (8 tools + type filter)",
+        "tools/list (9 tools + type filter)",
         has_all and type_arg,
         f"{sorted(tools)}",
     )
 except Exception as e:
-    check("tools/list (8 tools + type filter)", False, repr(e))
+    check("tools/list (9 tools + type filter)", False, repr(e))
 
 # 4. type filter actually restricts results -- SANDAG's catalog mixes Feature
 #    Services with Service Definitions, web maps, and apps; type='Feature
@@ -319,6 +320,82 @@ if parcels_id:
         check("spatial_query_point(by address)", ok, t.split("\n")[0][:60])
     except Exception as e:
         check("spatial_query_point(by address)", False, repr(e))
+
+# 13b. spatial_query_polygon -- libraries inside one El Cajon council
+#      district, then within a mile of it (server-side buffer must widen the
+#      match). Both layers are discovered by title, like Parcels above.
+districts_id = libraries_id = None
+try:
+    s = text_of(
+        call_tool(
+            "search_datasets",
+            {"q": "Council Districts", "type": "Feature Service", "limit": 10},
+        )
+    )
+    m = re.search(r"\d+\. Council_Districts\s*\n\s*ID:\s*(\S+)", s)
+    districts_id = m.group(1) if m else None
+    s = text_of(
+        call_tool(
+            "search_datasets", {"q": "Library", "type": "Feature Service", "limit": 10}
+        )
+    )
+    m = re.search(r"\d+\. Library\s*\n\s*ID:\s*(\S+)", s)
+    libraries_id = m.group(1) if m else None
+    check(
+        "search_datasets finds Council_Districts + Library",
+        bool(districts_id and libraries_id),
+        f"districts={districts_id} libraries={libraries_id}",
+    )
+except Exception as e:
+    check("search_datasets finds Council_Districts + Library", False, repr(e))
+
+POLYGON_ARGS = {
+    "filter_where": "jur_name = 'EL CAJON' AND district = 1",
+    "out_fields": "name,city",
+    "limit": 10,
+}
+if districts_id and libraries_id:
+    try:
+        args = {"item_id": libraries_id, "filter_item_id": districts_id, **POLYGON_ARGS}
+        t = text_of(call_tool("spatial_query_polygon", args))
+        m = re.search(r"TOTAL MATCHING:\s*(\d+)", t)
+        exact = int(m.group(1)) if m else None
+        check(
+            "spatial_query_polygon(libraries in a council district)",
+            exact is not None and "name" in t,
+            t.split("\n")[0][:60],
+        )
+        t = text_of(
+            call_tool(
+                "spatial_query_polygon", {**args, "distance": 1, "units": "miles"}
+            )
+        )
+        m = re.search(r"TOTAL MATCHING:\s*(\d+)", t)
+        buffered = int(m.group(1)) if m else None
+        check(
+            "spatial_query_polygon(1-mile buffer widens the match)",
+            exact is not None and buffered is not None and buffered > exact,
+            f"exact={exact} within 1 mi={buffered}",
+        )
+        # All El Cajon districts: a 4-feature union whose raw geometry
+        # exceeds the gateway's body cap, so it must be generalised, not 403.
+        r = call_tool(
+            "spatial_query_polygon",
+            {**args, "filter_where": "jur_name = 'EL CAJON'"},
+        )
+        sc = r["result"].get("structuredContent") or {}
+        summ = sc.get("summary", {})
+        check(
+            "spatial_query_polygon(4-district union fits the gateway cap)",
+            summ.get("filter_features") == 4
+            and summ.get("filter_simplified_m") is not None
+            and (summ.get("total_matching") or 0) >= exact,
+            f"filter_features={summ.get('filter_features')} "
+            f"simplified_m={summ.get('filter_simplified_m')} "
+            f"total={summ.get('total_matching')}",
+        )
+    except Exception as e:
+        check("spatial_query_polygon(libraries in a council district)", False, repr(e))
 
 # 14. get_aggregations sanity
 try:
@@ -558,6 +635,20 @@ if parcels_id:
         "spatial_query_point",
         {"item_id": parcels_id, "address": "202 C St, San Diego, CA", "limit": 2},
         expect_codes=["geocoded"],
+    )
+if districts_id and libraries_id:
+    check_structured(
+        "structured: spatial_query_polygon buffered by filter layer",
+        "spatial_query_polygon",
+        {
+            "item_id": libraries_id,
+            "filter_item_id": districts_id,
+            **POLYGON_ARGS,
+            "distance": 1,
+            "units": "miles",
+            "limit": 1,
+        },
+        expect_codes=["results_truncated"],
     )
 
 print("\n=== SUMMARY ===")

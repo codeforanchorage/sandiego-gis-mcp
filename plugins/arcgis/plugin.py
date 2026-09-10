@@ -9,6 +9,7 @@ standard Feature Service ``/query`` endpoints.
 """
 
 import html
+import json
 import logging
 import re
 import time
@@ -18,6 +19,7 @@ from datetime import datetime
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
+import pyclipper
 
 from core.interfaces import (
     DataPlugin,
@@ -86,6 +88,7 @@ CAVEAT_CODES = (
     "geocoded",
     "multiple_geocode_matches",
     "address_snapped",
+    "filter_simplified",
     "no_results",
 )
 
@@ -117,6 +120,16 @@ class _Caveats:
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+class _PolygonQueryResult(NamedTuple):
+    """spatial_query_polygon's answer: rows, best-effort total, and how many
+    filter-layer features were unioned (None for an inline geometry)."""
+
+    rows: List[Dict[str, Any]]
+    total_matching: Optional[int]
+    filter_features: Optional[int]
+    simplified_m: Optional[int]
 
 
 class _ToolOutput(NamedTuple):
@@ -408,6 +421,63 @@ _OUTPUT_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
         {"rows": {"type": "array", "items": _ROW_SCHEMA}},
     ),
+    "spatial_query_polygon": _envelope_schema(
+        "Features that spatially relate to a polygon filter, optionally buffered.",
+        {
+            "item_id": {"type": "string"},
+            "filter_item_id": _NULLABLE_STR,
+            "filter_where": {
+                **_NULLABLE_STR,
+                "description": "WHERE applied to `filter_item_id`; null for an inline geometry.",
+            },
+            "filter_geometry_type": {
+                **_NULLABLE_STR,
+                "description": (
+                    "GeoJSON type of the inline filter (Polygon, MultiPolygon, "
+                    "Feature); null when a filter layer was used."
+                ),
+            },
+            "spatial_rel": {"type": "string"},
+            "distance": {
+                "type": ["number", "null"],
+                "description": "Server-side buffer applied to the filter; null when unbuffered.",
+            },
+            "units": _NULLABLE_STR,
+            "where": {"type": "string"},
+            "out_fields": {"type": "string"},
+            "limit": {"type": "integer"},
+        },
+        {
+            "returned": {"type": "integer"},
+            "total_matching": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Server-side count of ALL features matching the filter. Null "
+                    "when the count query failed -- which is NOT zero."
+                ),
+            },
+            "filter_features": {
+                "type": ["integer", "null"],
+                "description": (
+                    "How many filter-layer features were unioned into the filter "
+                    "polygon; null for an inline `filter_geometry`."
+                ),
+            },
+            "filter_simplified_m": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Tolerance in metres the filter polygon was generalised to "
+                    "so it fits the gateway's body cap; null when sent as-is."
+                ),
+            },
+            "truncated": {
+                "type": "boolean",
+                "description": "True when more features match than were returned.",
+            },
+            "attribution": _ATTRIBUTION,
+        },
+        {"rows": {"type": "array", "items": _ROW_SCHEMA}},
+    ),
     "geocode_address": _envelope_schema(
         "Geocoder candidates.",
         {"address": {"type": "string"}},
@@ -477,6 +547,61 @@ class ArcGISPlugin(DataPlugin):
     # recovers the named parcel from a street-centerline geocode, 20 m
     # already pulls in unrelated lots across the block.
     _ADDRESS_SNAP_METERS = 10
+
+    # spatial_query_polygon: spatial relations and linear units accepted from
+    # the model, and their ArcGIS REST spellings.
+    _SPATIAL_REL_MAP = {
+        "intersects": "esriSpatialRelIntersects",
+        "contains": "esriSpatialRelContains",
+        "within": "esriSpatialRelWithin",
+        "crosses": "esriSpatialRelCrosses",
+        "touches": "esriSpatialRelTouches",
+        "overlaps": "esriSpatialRelOverlaps",
+        "envelope_intersects": "esriSpatialRelEnvelopeIntersects",
+    }
+    _LINEAR_UNIT_ALIASES = {
+        "meters": "meters", "meter": "meters", "metre": "meters",
+        "metres": "meters", "m": "meters",
+        "kilometers": "kilometers", "kilometer": "kilometers",
+        "kilometre": "kilometers", "kilometres": "kilometers",
+        "km": "kilometers",
+        "feet": "feet", "foot": "feet", "ft": "feet",
+        "miles": "miles", "mile": "miles", "mi": "miles",
+        "yards": "yards", "yard": "yards", "yd": "yards",
+    }  # fmt: skip
+    _ESRI_LINEAR_UNITS = {
+        "meters": "esriSRUnit_Meter",
+        "kilometers": "esriSRUnit_Kilometer",
+        "feet": "esriSRUnit_Foot",
+        "miles": "esriSRUnit_StatuteMile",
+        "yards": "esriSRUnit_Yard",
+    }
+
+    # Caps on inbound filter polygons. ArcGIS accepts far larger geometries,
+    # but they become huge POST bodies and slow spatial plans. A SANDAG
+    # council district is ~2,400 coordinates; these leave ample headroom.
+    MAX_FILTER_RINGS = 1000
+    MAX_FILTER_COORDS = 10000
+    # SANDAG's gateway (Azure Application Gateway WAF) answers a bare 403 to
+    # request bodies over ~128 KB: measured 2026-09-09, a 96 KB body passes
+    # and 144 KB is refused. Filter geometry is serialised to 6 decimals
+    # (~0.1 m) and, when still over this budget, generalised with pyclipper
+    # at the smallest tolerance in the ladder that fits; the response
+    # carries a `filter_simplified` caveat naming the tolerance. The 4-ring
+    # El Cajon council-district union (155 KB) fits at 1 m with the same
+    # library count as the per-district queries.
+    MAX_FILTER_BYTES = 90_000
+    _SIMPLIFY_LADDER_M = (1, 2, 5, 10, 20, 50)
+    _METERS_PER_DEGREE = 111_000.0
+    # Cap on filter-layer features fetched and unioned into one filter
+    # polygon. Above this, refuse LOUDLY rather than silently union a
+    # truncated subset. Sized for the 20 s plugin timeout: 500 polygons
+    # with geometry is one page from a MaxRecordCount=2000 service.
+    MAX_FILTER_FEATURES = 500
+    FILTER_FETCH_PAGE = 500
+    # Integer scaling for the degree-space pyclipper union of filter rings:
+    # 1 clipper unit = 1e-7 degree (~1 cm).
+    _UNION_DEG_SCALE = 1e7
 
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__(config)
@@ -589,6 +714,7 @@ class ArcGISPlugin(DataPlugin):
         "get_layer_schema": "Layer Schema",
         "get_distinct_values": "Distinct Values",
         "spatial_query_point": "What's at This Point",
+        "spatial_query_polygon": "Query by Area or Buffer",
         "geocode_address": "Geocode Address",
     }
 
@@ -872,6 +998,119 @@ class ArcGISPlugin(DataPlugin):
                             "default": 10,
                             "minimum": 1,
                             "maximum": 50,
+                        },
+                    },
+                    "required": ["item_id"],
+                },
+            ),
+            ToolDefinition(
+                name="spatial_query_polygon",
+                description=(
+                    "Server-side spatial selection: return the features of a "
+                    "dataset that intersect (or otherwise relate to) a polygon. "
+                    "The polygon is EITHER inline GeoJSON (`filter_geometry`, "
+                    "WGS84) OR feature(s) of another polygon layer "
+                    "(`filter_item_id` + `filter_where`, e.g. one council "
+                    "district; all matching features are unioned). The target "
+                    "layer can be polygon, line, or point. PROXIMITY ('within N "
+                    "miles/feet of X'): set `distance` + `units` to buffer the "
+                    "filter polygon server-side -- e.g. libraries within 1 mile "
+                    "of a district = item_id=<libraries>, "
+                    'filter_item_id=<districts>, filter_where="district = 1", '
+                    "distance=1, units='miles'. Call get_layer_schema on BOTH "
+                    "layers first: they have different fields. Output leads "
+                    "with TOTAL MATCHING, so 'how many X in Y?' needs no "
+                    "paging. Returns attributes only, no geometry."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {
+                            "type": "string",
+                            "description": (
+                                "Dataset ID of the TARGET layer (the features "
+                                "to select). Polygon, line, or point."
+                            ),
+                        },
+                        "filter_item_id": {
+                            "type": "string",
+                            "description": (
+                                "Dataset ID of a POLYGON layer whose feature(s) "
+                                "form the filter. Combine with filter_where to "
+                                "pick specific features. Prefer this over "
+                                "filter_geometry when the boundary is already "
+                                "published (districts, jurisdictions, zones)."
+                            ),
+                        },
+                        "filter_where": {
+                            "type": "string",
+                            "description": (
+                                "WHERE clause on filter_item_id selecting the "
+                                "filter feature(s), e.g. \"jur_name = 'EL CAJON'\". "
+                                "All matches are unioned into one polygon."
+                            ),
+                            "default": "1=1",
+                        },
+                        "filter_geometry": {
+                            "type": "object",
+                            "description": (
+                                "Inline GeoJSON Polygon, MultiPolygon, or a "
+                                "Feature wrapping one, in WGS84 (lon, lat). "
+                                "Alternative to filter_item_id."
+                            ),
+                        },
+                        "spatial_rel": {
+                            "type": "string",
+                            "enum": [
+                                "intersects",
+                                "contains",
+                                "within",
+                                "crosses",
+                                "touches",
+                                "overlaps",
+                                "envelope_intersects",
+                            ],
+                            "description": (
+                                "Spatial relation of target to filter: "
+                                "'intersects' (any overlap, default), 'contains' "
+                                "(filter contains target), 'within' (target "
+                                "within filter), 'crosses', 'touches', "
+                                "'overlaps', 'envelope_intersects'."
+                            ),
+                            "default": "intersects",
+                        },
+                        "distance": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": (
+                                "Buffer the filter polygon by this distance "
+                                "(in `units`) before testing spatial_rel. Use "
+                                "for 'within N of' questions. Omit or 0 for an "
+                                "exact overlap."
+                            ),
+                        },
+                        "units": {
+                            "type": "string",
+                            "enum": ["meters", "kilometers", "feet", "miles", "yards"],
+                            "description": "Linear unit for `distance` (default meters).",
+                            "default": "meters",
+                        },
+                        "where": {
+                            "type": "string",
+                            "description": "Optional WHERE clause on the target layer.",
+                            "default": "1=1",
+                        },
+                        "out_fields": {
+                            "type": "string",
+                            "description": "Comma-separated target field names to return.",
+                            "default": "*",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max features (default 25, max 1000).",
+                            "default": 25,
+                            "minimum": 1,
+                            "maximum": 1000,
                         },
                     },
                     "required": ["item_id"],
@@ -1323,6 +1562,106 @@ class ArcGISPlugin(DataPlugin):
         )
         text = self._with_caveats(
             self._format_query_results(records, limit, attribution=attribution),
+            caveats,
+        )
+        return _ToolOutput(text, structured)
+
+    async def _tool_spatial_query_polygon(self, a: Dict[str, Any]) -> _ToolOutput:
+        caveats = _Caveats()
+        item_id = self._require_str(a, "item_id")
+        filter_item_id = a.get("filter_item_id") or None
+        filter_where = a.get("filter_where") or "1=1"
+        filter_geometry = a.get("filter_geometry")
+        if filter_geometry is not None and not isinstance(filter_geometry, dict):
+            raise ToolInputError(
+                f"filter_geometry must be a GeoJSON object "
+                f"(got {type(filter_geometry).__name__})"
+            )
+        spatial_rel = str(a.get("spatial_rel") or "intersects").lower()
+        distance = self._float_arg(a, "distance")
+        if distance is not None and distance < 0:
+            raise ToolInputError(f"distance must be >= 0 (got {distance})")
+        buffered = bool(distance)
+        units = self._normalize_linear_unit(a.get("units")) if buffered else None
+        where = a.get("where") or "1=1"
+        out_fields = a.get("out_fields") or "*"
+        limit = self._clamp_limit(self._int_arg(a, "limit", 25), 1000, caveats)
+        result = await self.spatial_query_polygon(
+            item_id,
+            filter_geometry=filter_geometry,
+            filter_item_id=filter_item_id,
+            filter_where=filter_where,
+            spatial_rel=spatial_rel,
+            where=where,
+            out_fields=out_fields,
+            limit=limit,
+            distance=distance if buffered else None,
+            units=units or "meters",
+        )
+        records, total = result.rows, result.total_matching
+        if result.simplified_m is not None:
+            caveats.add(
+                "filter_simplified",
+                f"The filter polygon exceeded the SANDAG gateway's request "
+                f"body cap and was generalised to a {result.simplified_m} m "
+                f"tolerance before the query; features within "
+                f"{result.simplified_m} m of the filter boundary may be "
+                f"included or missed.",
+            )
+        if total is None:
+            caveats.add(
+                "count_unavailable",
+                "The total match count is unavailable: the count query "
+                "failed, so the total is unknown (not zero).",
+            )
+        attribution = await self._attribution_for(item_id)
+        truncated = (total is not None and total > len(records)) or (
+            total is None and len(records) >= limit
+        )
+        if truncated:
+            caveats.add(
+                "results_truncated",
+                f"Only the first {len(records)} matching feature(s) are shown"
+                + (f" of {total}" if total is not None else "")
+                + f" (limit {limit}); raise limit or narrow `where`.",
+            )
+        if not records:
+            caveats.add(
+                "no_results",
+                "No feature in the target layer matched the filter polygon. "
+                "Check `where` against get_layer_schema, and that filter_where "
+                "selects the intended feature(s) of the filter layer.",
+            )
+        structured = self._envelope(
+            {
+                "item_id": item_id,
+                "filter_item_id": filter_item_id,
+                "filter_where": filter_where if filter_item_id else None,
+                "filter_geometry_type": (
+                    str(filter_geometry.get("type", "")) if filter_geometry else None
+                ),
+                "spatial_rel": spatial_rel,
+                "distance": distance if buffered else None,
+                "units": units,
+                "where": where,
+                "out_fields": out_fields,
+                "limit": limit,
+            },
+            {
+                "returned": len(records),
+                "total_matching": total,
+                "filter_features": result.filter_features,
+                "filter_simplified_m": result.simplified_m,
+                "truncated": bool(truncated),
+                "attribution": attribution,
+            },
+            caveats,
+            rows=records,
+        )
+        text = self._with_caveats(
+            self._format_query_results(
+                records, limit, total=total, attribution=attribution
+            ),
             caveats,
         )
         return _ToolOutput(text, structured)
@@ -1785,13 +2124,19 @@ class ArcGISPlugin(DataPlugin):
         return await self._ensure_layer_url(service_url)
 
     async def _query_layer(
-        self, layer_url: str, params: Dict[str, Any]
+        self, layer_url: str, params: Dict[str, Any], post: bool = False
     ) -> Dict[str, Any]:
         """Run an ArcGIS Feature Service /query and return parsed JSON, raising
-        on HTTP errors or error objects embedded in the response body."""
+        on HTTP errors or error objects embedded in the response body.
+
+        `post` sends the params as a form body: filter polygons routinely
+        exceed URL length limits, a point never does."""
         query_url = f"{layer_url}/query"
         try:
-            response = await self.feature_client.get(query_url, params=params)
+            if post:
+                response = await self.feature_client.post(query_url, data=params)
+            else:
+                response = await self.feature_client.get(query_url, params=params)
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
@@ -1927,6 +2272,326 @@ class ArcGISPlugin(DataPlugin):
             params["units"] = "esriSRUnit_Meter"
         data = await self._query_layer(layer_url, params)
         return [f.get("attributes", {}) for f in data.get("features", [])]
+
+    async def spatial_query_polygon(
+        self,
+        item_id: str,
+        filter_geometry: Optional[Dict[str, Any]] = None,
+        filter_item_id: Optional[str] = None,
+        filter_where: str = "1=1",
+        spatial_rel: str = "intersects",
+        where: str = "1=1",
+        out_fields: str = "*",
+        limit: int = 25,
+        distance: Optional[float] = None,
+        units: str = "meters",
+    ) -> _PolygonQueryResult:
+        """Features of `item_id` that spatially relate to a polygon filter.
+
+        The filter is inline GeoJSON (`filter_geometry`) or the union of the
+        features `filter_where` selects in `filter_item_id`. A positive
+        `distance` buffers the filter server-side before `spatial_rel` is
+        tested, which is how "within N miles of X" is answered. The total
+        count is best-effort: None (never zero) when the count query fails.
+        """
+        if not filter_geometry and not filter_item_id:
+            raise ToolInputError(
+                "Provide either `filter_geometry` (inline GeoJSON polygon) or "
+                "`filter_item_id` (+ optional `filter_where`)."
+            )
+        spatial_rel_esri = self._SPATIAL_REL_MAP.get((spatial_rel or "").lower())
+        if not spatial_rel_esri:
+            raise ToolInputError(
+                f"spatial_rel must be one of {sorted(self._SPATIAL_REL_MAP)} "
+                f"(got {spatial_rel!r})"
+            )
+        esri_units: Optional[str] = None
+        if distance is not None:
+            if distance < 0:
+                raise ToolInputError(f"distance must be >= 0 (got {distance})")
+            if distance > 0:
+                esri_units = self._ESRI_LINEAR_UNITS[self._normalize_linear_unit(units)]
+
+        filter_features: Optional[int] = None
+        if filter_geometry:
+            esri_filter = self._geojson_to_esri_polygon(filter_geometry)
+        else:
+            esri_filter, filter_features = await self._fetch_filter_polygon(
+                filter_item_id or "", filter_where
+            )
+
+        rings, simplified_m = self._fit_filter_to_budget(esri_filter["rings"])
+
+        layer_url = await self._layer_url_for_item(item_id)
+        where_clause = WhereValidator.validate(where)
+        params: Dict[str, Any] = {
+            "where": where_clause,
+            "geometry": self._serialize_rings(rings),
+            "geometryType": "esriGeometryPolygon",
+            "inSR": 4326,
+            "spatialRel": spatial_rel_esri,
+            "outFields": out_fields,
+            "returnGeometry": "false",
+            "outSR": 4326,
+            "resultRecordCount": min(max(limit, 1), 1000),
+            "f": "json",
+        }
+        if esri_units:
+            params["distance"] = distance
+            params["units"] = esri_units
+        data = await self._query_layer(layer_url, params, post=True)
+        rows = [f.get("attributes", {}) for f in data.get("features", [])]
+
+        # Total match count is best-effort: a count failure must not hide
+        # the rows we already fetched.
+        count_params = {
+            k: v
+            for k, v in params.items()
+            if k not in ("resultRecordCount", "outFields")
+        }
+        count_params["returnCountOnly"] = "true"
+        try:
+            count_data = await self._query_layer(layer_url, count_params, post=True)
+            total: Optional[int] = int(count_data["count"])
+        except Exception as count_err:
+            logger.warning(f"Could not count polygon-query matches: {count_err}")
+            total = None
+        return _PolygonQueryResult(rows, total, filter_features, simplified_m)
+
+    @staticmethod
+    def _serialize_rings(rings: List[Any]) -> str:
+        """Compact Esri polygon JSON, coordinates rounded to 6 decimals
+        (~0.1 m): the server's 15-digit floats are a third of the body."""
+        rounded = [
+            [[round(pt[0], 6), round(pt[1], 6)] for pt in ring] for ring in rings
+        ]
+        return json.dumps(
+            {"rings": rounded, "spatialReference": {"wkid": 4326}},
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _fit_filter_to_budget(cls, rings: List[Any]) -> Tuple[List[Any], Optional[int]]:
+        """Generalise the filter rings until they fit MAX_FILTER_BYTES.
+
+        Returns the rings to send and the tolerance in metres they were
+        cleaned to, or None when they were small enough as-is. Refuses when
+        even the coarsest tolerance does not fit.
+        """
+        if len(cls._serialize_rings(rings)) <= cls.MAX_FILTER_BYTES:
+            return rings, None
+        paths = cls._rings_to_paths(rings)
+        for tol_m in cls._SIMPLIFY_LADDER_M:
+            tol = int(round(tol_m / cls._METERS_PER_DEGREE * cls._UNION_DEG_SCALE))
+            cleaned = cls._paths_to_rings(pyclipper.CleanPolygons(paths, tol))
+            if cleaned and len(cls._serialize_rings(cleaned)) <= cls.MAX_FILTER_BYTES:
+                return cleaned, tol_m
+        raise ToolInputError(
+            f"The filter polygon is too large to send even after generalising "
+            f"it to {cls._SIMPLIFY_LADDER_M[-1]} m. Narrow filter_where to "
+            f"fewer features, or pass a simpler filter_geometry."
+        )
+
+    @classmethod
+    def _normalize_linear_unit(cls, units: Optional[str]) -> str:
+        """Canonicalize a free-text linear unit (default meters)."""
+        key = (units or "meters").strip().lower()
+        canonical = cls._LINEAR_UNIT_ALIASES.get(key)
+        if canonical is None:
+            raise ToolInputError(
+                f"units {units!r} is not a supported linear unit. Use one of: "
+                f"meters, kilometers, feet, miles, yards."
+            )
+        return canonical
+
+    @classmethod
+    def _geojson_to_esri_polygon(cls, geojson: Any) -> Dict[str, Any]:
+        """GeoJSON Polygon / MultiPolygon / Feature -> Esri polygon JSON (WGS84)."""
+        if not isinstance(geojson, dict):
+            raise ToolInputError(
+                f"filter_geometry must be a GeoJSON object "
+                f"(got {type(geojson).__name__})"
+            )
+        gj_type = geojson.get("type", "")
+        if gj_type == "Feature":
+            return cls._geojson_to_esri_polygon(geojson.get("geometry") or {})
+        if gj_type == "Polygon":
+            rings = list(geojson.get("coordinates") or [])
+        elif gj_type == "MultiPolygon":
+            rings = []
+            for poly in geojson.get("coordinates") or []:
+                rings.extend(poly)
+        else:
+            raise ToolInputError(
+                f"filter_geometry must be a GeoJSON Polygon, MultiPolygon, or "
+                f"Feature wrapping one (got type={gj_type!r})"
+            )
+        if not rings:
+            raise ToolInputError("filter_geometry has no polygon rings")
+        if len(rings) > cls.MAX_FILTER_RINGS:
+            raise ToolInputError(
+                f"filter_geometry has {len(rings)} rings; max is "
+                f"{cls.MAX_FILTER_RINGS}. Simplify the polygon or use "
+                f"filter_item_id with a published boundary layer."
+            )
+        coord_count = sum(len(r) for r in rings if isinstance(r, list))
+        if coord_count > cls.MAX_FILTER_COORDS:
+            raise ToolInputError(
+                f"filter_geometry has {coord_count} coordinates; max is "
+                f"{cls.MAX_FILTER_COORDS}. Simplify the polygon or use "
+                f"filter_item_id with a published boundary layer."
+            )
+        return {"rings": rings, "spatialReference": {"wkid": 4326}}
+
+    @classmethod
+    def _union_esri_rings(
+        cls, rings: List[List[List[float]]]
+    ) -> Optional[List[List[List[float]]]]:
+        """Geometrically union possibly overlapping rings.
+
+        Concatenating the rings of several features is NOT a union: under the
+        even-odd fill rule, overlapping same-orientation rings flip covered
+        area into holes, so the filter region SHRINKS as features are added.
+        pyclipper resolves them into clean non-overlapping rings. Returns
+        rings in Esri orientation, or None when the union is empty or
+        pyclipper rejects the input -- callers fall back to the raw rings.
+        """
+        paths = cls._rings_to_paths(rings)
+        if not paths:
+            return None
+        try:
+            pc = pyclipper.Pyclipper()
+            pc.AddPaths(paths, pyclipper.PT_SUBJECT, True)
+            solution = pc.Execute(
+                pyclipper.CT_UNION, pyclipper.PFT_NONZERO, pyclipper.PFT_NONZERO
+            )
+        except pyclipper.ClipperException:
+            return None
+        # Clipper emits CCW exteriors / CW holes (y-up); Esri wants the
+        # opposite, so reverse every ring.
+        return cls._paths_to_rings(solution, reverse=True) or None
+
+    @classmethod
+    def _rings_to_paths(cls, rings: List[Any]) -> List[List[Tuple[int, int]]]:
+        """Closed coordinate rings -> open integer pyclipper paths."""
+        scale = cls._UNION_DEG_SCALE
+        paths = []
+        for ring in rings or []:
+            if not isinstance(ring, list):
+                continue
+            path = [
+                (int(round(pt[0] * scale)), int(round(pt[1] * scale)))
+                for pt in ring
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2
+            ]
+            if len(path) > 1 and path[0] == path[-1]:
+                path.pop()
+            if len(path) >= 3:
+                paths.append(path)
+        return paths
+
+    @classmethod
+    def _paths_to_rings(
+        cls, paths: List[Any], reverse: bool = False
+    ) -> List[List[List[float]]]:
+        """Integer pyclipper paths -> closed coordinate rings."""
+        scale = cls._UNION_DEG_SCALE
+        out: List[List[List[float]]] = []
+        for path in paths:
+            if len(path) < 3:
+                continue
+            pts = reversed(path) if reverse else path
+            ring = [[x / scale, y / scale] for x, y in pts]
+            ring.append(list(ring[0]))
+            out.append(ring)
+        return out
+
+    async def _fetch_filter_polygon(
+        self, filter_item_id: str, filter_where: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Resolve a filter polygon from feature(s) of another layer.
+
+        Validates that the layer is polygonal, refuses LOUDLY when the WHERE
+        matches more than MAX_FILTER_FEATURES (silently unioning a truncated
+        subset is exactly the quiet false negative to avoid), and returns the
+        unioned Esri polygon plus the feature count.
+        """
+        validated_where = WhereValidator.validate(filter_where or "1=1")
+        layer_url = await self._layer_url_for_item(filter_item_id)
+        try:
+            meta_resp = await self.feature_client.get(layer_url, params={"f": "json"})
+            meta_resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"Feature Service metadata error (HTTP {e.response.status_code}): "
+                f"{e.response.text}"
+            ) from e
+        meta = meta_resp.json()
+        if "error" in meta:
+            raise RuntimeError(
+                f"Feature Service metadata error: "
+                f"{meta['error'].get('message', str(meta['error']))}"
+            )
+        geom_type = meta.get("geometryType", "")
+        if geom_type != "esriGeometryPolygon":
+            raise ToolInputError(
+                f"filter_item_id must be a polygon layer (got "
+                f"geometryType={geom_type or 'unknown'!r}); check it with "
+                f"get_layer_schema."
+            )
+
+        count_data = await self._query_layer(
+            layer_url,
+            {"where": validated_where, "returnCountOnly": "true", "f": "json"},
+        )
+        match_count = int(count_data.get("count") or 0)
+        if match_count > self.MAX_FILTER_FEATURES:
+            raise ToolInputError(
+                f"filter_where {validated_where!r} matches {match_count:,} "
+                f"features in filter layer {filter_item_id}; max is "
+                f"{self.MAX_FILTER_FEATURES:,} for a spatial filter. Narrow "
+                f"the WHERE clause."
+            )
+        if match_count == 0:
+            raise ToolInputError(
+                f"filter_where {validated_where!r} matched no features in "
+                f"filter layer {filter_item_id}; confirm the value with "
+                f"get_distinct_values."
+            )
+
+        features: List[Dict[str, Any]] = []
+        while len(features) < match_count:
+            data = await self._query_layer(
+                layer_url,
+                {
+                    "where": validated_where,
+                    "outFields": "",
+                    "returnGeometry": "true",
+                    "outSR": 4326,
+                    "resultRecordCount": self.FILTER_FETCH_PAGE,
+                    "resultOffset": len(features),
+                    "f": "json",
+                },
+                post=True,
+            )
+            page = data.get("features", [])
+            if not page:
+                break
+            features.extend(page)
+
+        rings: List[Any] = []
+        for f in features:
+            rings.extend((f.get("geometry") or {}).get("rings") or [])
+        if not rings:
+            raise ToolInputError(
+                f"The {len(features)} filter feature(s) in {filter_item_id} "
+                f"have no polygon rings"
+            )
+        # One feature's rings are already a coherent polygon: pass them
+        # through untouched. Several need a REAL union (see _union_esri_rings).
+        if len(features) > 1:
+            rings = self._union_esri_rings(rings) or rings
+        return {"rings": rings, "spatialReference": {"wkid": 4326}}, len(features)
 
     async def geocode_address(self, address: str) -> List[Dict[str, Any]]:
         """Geocode a street address to WGS84 lon/lat.

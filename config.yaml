@@ -43,6 +43,10 @@ instructions: |
      MATCHING, so 'how many X?' questions need no paging -- and
      spatial_query_point with a street address or lon/lat for 'what parcel /
      flood zone / district is at this location?'.
+  4. spatial_query_polygon for 'which X are inside Y' and 'within N miles of
+     Y': item_id is the target layer, the filter polygon is filter_item_id +
+     filter_where (e.g. one council district) or inline GeoJSON; add
+     distance + units for proximity. It also leads with TOTAL MATCHING.
 
   Data facts to apply to every answer:
   - Coordinates in and out are WGS84 (EPSG:4326). Layers are stored in CA

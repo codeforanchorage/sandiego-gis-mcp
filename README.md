@@ -43,6 +43,7 @@ Discovery searches SANDAG's portal catalog anonymously (`geo.sandag.org/portal/s
 | `arcgis__get_distinct_values` | List the distinct values in a field (with optional `like` / `where`) to confirm exact codes |
 | `arcgis__query_data` | Query features from a dataset (supports `where`, `out_fields`, `order_by`, `limit`). Output leads with a `TOTAL MATCHING` count, so "how many X?" needs no paging. Pages with `resultOffset` when a layer's `MaxRecordCount` truncates a response. |
 | `arcgis__spatial_query_point` | Point-in-polygon: which polygon(s) contain a given point — by `lon`/`lat` **or** a street `address` |
+| `arcgis__spatial_query_polygon` | Features inside (or within `distance` of) a polygon — the polygon is inline GeoJSON **or** feature(s) of another layer (`filter_item_id` + `filter_where`). Leads with `TOTAL MATCHING`. |
 | `arcgis__geocode_address` | Convert a street address to `lon`/`lat` via the SANDAG composite locator (`SANDAG_COMPOSITE_LOCATOR` GeocodeServer) |
 | `arcgis__get_aggregations` | Facet counts across the catalog (e.g. by `type`, `tags`, `owner`), tallied over the top matching items |
 
@@ -92,6 +93,22 @@ ArcGIS field names are **case-sensitive** — and SANDAG's hosted layers use low
 ```
 
 Returns the attributes of every polygon containing the point (no geometry); when an address is used, the matched address is shown. You can also geocode on its own with `geocode_address`.
+
+### Spatial selection: `spatial_query_polygon` (inside an area, or within a distance of it)
+
+"Which X are inside Y?" and "which X are within N miles of Y?" — a server-side spatial join against any Feature Service (point, line, or polygon). The filter polygon is **either** feature(s) of another polygon layer, selected with `filter_item_id` + `filter_where` and unioned, **or** inline GeoJSON in `filter_geometry`. Set `distance` + `units` to buffer the filter first:
+
+```jsonc
+// arcgis__spatial_query_polygon — libraries inside El Cajon council district 1
+{ "item_id": "<library-id>", "filter_item_id": "<council-districts-id>",
+  "filter_where": "jur_name = 'EL CAJON' AND district = 1", "out_fields": "name,city" }
+
+// ...and within a mile of it (server-side buffer)
+{ "item_id": "<library-id>", "filter_item_id": "<council-districts-id>",
+  "filter_where": "jur_name = 'EL CAJON' AND district = 1", "distance": 1, "units": "miles" }
+```
+
+The output leads with `TOTAL MATCHING`, so "how many X in Y?" needs no paging. `spatial_rel` (default `intersects`) accepts `contains`, `within`, `crosses`, `touches`, `overlaps`, and `envelope_intersects`. Call `get_layer_schema` on **both** layers before writing `where` / `filter_where` — they have different fields.
 
 ---
 
