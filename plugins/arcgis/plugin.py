@@ -8,6 +8,7 @@ directory (``/rest/services``) when it is not. Queries go straight to the
 standard Feature Service ``/query`` endpoints.
 """
 
+import asyncio
 import html
 import json
 import logging
@@ -89,6 +90,7 @@ CAVEAT_CODES = (
     "multiple_geocode_matches",
     "address_snapped",
     "filter_simplified",
+    "directory_mode",
     "no_results",
 )
 
@@ -541,6 +543,15 @@ class ArcGISPlugin(DataPlugin):
     # The services directory changes rarely; cache the walk so each search
     # doesn't re-fetch every folder.
     _DIRECTORY_CACHE_TTL = 300.0
+    # The directory listing carries nothing but service names, so each
+    # queryable service is described from its own metadata (description,
+    # copyrightText, layer names) in one fan-out under a wall-clock budget.
+    # Measured 2026-09-09: 382 services at ~60 ms each is ~2 s at 16-wide;
+    # serial would be ~24 s, past the 20 s plugin timeout. A service whose
+    # fetch fails or misses the budget simply stays name-only.
+    _DIRECTORY_ENRICH_CONCURRENCY = 16
+    _DIRECTORY_ENRICH_BUDGET_S = 8.0
+    _DIRECTORY_ENRICH_REQUEST_TIMEOUT_S = 5.0
 
     # Retry radius for address-form spatial_query_point when the geocoded
     # point hits nothing. Verified against SANDAG parcels at City Hall: 10 m
@@ -1320,6 +1331,13 @@ class ArcGISPlugin(DataPlugin):
         field = self._require_str(a, "field")
         q = a.get("q") or None
         buckets = await self.get_aggregations(field, q)
+        if self._search_mode == "directory" and field in ("tags", "owner"):
+            caveats.add(
+                "directory_mode",
+                f"Portal catalog search is unavailable, so discovery is "
+                f"running from the services directory, which records no "
+                f"{field}; only 'type' facets are meaningful in this mode.",
+            )
         if not buckets:
             caveats.add(
                 "no_results",
@@ -1803,15 +1821,68 @@ class ArcGISPlugin(DataPlugin):
                 continue
             services.extend(fdata.get("services", []))
 
+        await self._enrich_directory_services(services)
         self._directory_cache = services
         self._directory_cache_expiry = now + self._DIRECTORY_CACHE_TTL
         return services
 
+    async def _enrich_directory_services(self, services: List[Dict[str, Any]]) -> None:
+        """Attach description, attribution and layer names to each queryable
+        service from its own metadata, in parallel under a wall-clock budget.
+        Nothing here can fail the walk: a fetch that errors or does not
+        finish in time leaves that service name-only."""
+        targets = [s for s in services if s.get("type") in self._SERVER_TO_TYPE]
+        if not targets:
+            return
+        base = self.plugin_config.services_url
+        semaphore = asyncio.Semaphore(self._DIRECTORY_ENRICH_CONCURRENCY)
+
+        async def describe(svc: Dict[str, Any]) -> None:
+            async with semaphore:
+                response = await self.feature_client.get(
+                    f"{base}/{svc['name']}/{svc['type']}",
+                    params={"f": "json"},
+                    timeout=self._DIRECTORY_ENRICH_REQUEST_TIMEOUT_S,
+                )
+                response.raise_for_status()
+                meta = response.json()
+            if "error" in meta:
+                return
+            description = self._clean_text(
+                meta.get("serviceDescription") or meta.get("description") or ""
+            )
+            if len(description) > 300:
+                description = description[:300] + "..."
+            svc["description"] = description
+            svc["attribution"] = self._clean_text(meta.get("copyrightText") or "")
+            svc["layers"] = [
+                str(layer.get("name"))
+                for layer in (meta.get("layers") or [])
+                if layer.get("name")
+            ]
+
+        tasks = [asyncio.create_task(describe(s)) for s in targets]
+        done, pending = await asyncio.wait(
+            tasks, timeout=self._DIRECTORY_ENRICH_BUDGET_S
+        )
+        for task in pending:
+            task.cancel()
+        failed = sum(1 for t in done if t.exception() is not None)
+        if failed or pending:
+            logger.warning(
+                f"Directory enrichment described {len(done) - failed} of "
+                f"{len(targets)} services: {failed} failed, {len(pending)} "
+                f"unfinished within {self._DIRECTORY_ENRICH_BUDGET_S:.0f}s"
+            )
+
     async def _search_directory(
         self, query: str, limit: int, item_type: Optional[str]
     ) -> List[Dict[str, Any]]:
-        """Substring-match service names in the services directory. Dataset
-        IDs in this mode are service paths like 'Hosted/Parcels/FeatureServer'."""
+        """Substring-match services in the services directory: every term
+        must appear in the service name, or failing that in its description
+        or layer names (see _enrich_directory_services). Name matches rank
+        first. Dataset IDs in this mode are service paths like
+        'Hosted/Parcels/FeatureServer'."""
         server_types = set(self._TYPE_TO_SERVER.values())
         if item_type:
             wanted = self._TYPE_TO_SERVER.get(item_type.lower())
@@ -1820,33 +1891,41 @@ class ArcGISPlugin(DataPlugin):
             server_types = {wanted}
 
         terms = [t for t in query.lower().split() if t]
-        results = []
+        name_hits: List[Dict[str, Any]] = []
+        text_hits: List[Dict[str, Any]] = []
         for svc in await self._list_services_directory():
             if svc.get("type") not in server_types:
                 continue
-            name = svc.get("name", "")  # e.g. "Hosted/Parcels"
-            haystack = name.lower().replace("_", " ")
-            if terms and not all(t in haystack for t in terms):
-                continue
-            path = f"{name}/{svc['type']}"
-            results.append(
-                {
-                    "id": path,
-                    "title": name.rsplit("/", 1)[-1].replace("_", " "),
-                    "description": "",
-                    "type": self._SERVER_TO_TYPE[svc["type"]],
-                    "url": f"{self.plugin_config.services_url}/{path}",
-                    "access": "public",
-                    "owner": "",
-                    "created": "",
-                    "modified": "",
-                    "tags": [],
-                    "extent": [],
-                }
+            name_text = svc.get("name", "").lower().replace("_", " ")
+            full_text = (
+                " ".join(
+                    [name_text, svc.get("description", ""), *svc.get("layers", [])]
+                )
+                .lower()
+                .replace("_", " ")
             )
-            if len(results) >= limit:
-                break
-        return results
+            if not terms or all(t in name_text for t in terms):
+                name_hits.append(svc)
+            elif all(t in full_text for t in terms):
+                text_hits.append(svc)
+        return [self._directory_result(svc) for svc in (name_hits + text_hits)[:limit]]
+
+    def _directory_result(self, svc: Dict[str, Any]) -> Dict[str, Any]:
+        name = svc.get("name", "")  # e.g. "Hosted/Parcels"
+        path = f"{name}/{svc['type']}"
+        return {
+            "id": path,
+            "title": name.rsplit("/", 1)[-1].replace("_", " "),
+            "description": svc.get("description", ""),
+            "type": self._SERVER_TO_TYPE[svc["type"]],
+            "url": f"{self.plugin_config.services_url}/{path}",
+            "access": "public",
+            "owner": "",
+            "created": "",
+            "modified": "",
+            "tags": [],
+            "extent": [],
+        }
 
     async def get_dataset(self, dataset_id: str) -> Dict[str, Any]:
         now = time.monotonic()

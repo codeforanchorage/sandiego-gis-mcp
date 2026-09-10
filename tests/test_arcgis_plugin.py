@@ -4,6 +4,11 @@ These tests verify plugin initialization, tool execution, API interactions,
 error handling, and data formatting. Tests are designed to fail if functionality breaks.
 """
 
+import asyncio
+import copy
+import logging
+import time
+
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -319,12 +324,33 @@ class TestSearchDatasetsTypeFilter:
 
 class TestDirectorySearch:
     @staticmethod
-    def _plugin(arcgis_config, responses):
+    def _plugin(arcgis_config, responses, metadata=None, delay=0.0):
+        """`responses` answer the root and folder listings in order.
+        `metadata` maps 'Folder/Service/FeatureServer' -> service JSON for
+        the per-service enrichment fetches; a service missing from it
+        fails its fetch (connection error). `delay` slows every metadata
+        fetch, to exercise the wall-clock budget."""
         plugin = ArcGISPlugin(arcgis_config)
         plugin.plugin_config = ArcGISPluginConfig(**arcgis_config)
         plugin._search_mode = "directory"
+        # Deep-copied: enrichment annotates the service dicts in place and
+        # the payloads are shared class attributes.
+        listings = iter([_resp(copy.deepcopy(p)) for p in responses])
+        metadata = copy.deepcopy(metadata or {})
+        base = plugin.plugin_config.services_url + "/"
+
+        async def fake_get(url, params=None, **kwargs):
+            path = url[len(base) :] if url.startswith(base) else ""
+            if path.endswith(("/FeatureServer", "/MapServer")):
+                if delay:
+                    await asyncio.sleep(delay)
+                if path not in metadata:
+                    raise httpx.ConnectError("no metadata", request=Mock())
+                return _resp(metadata[path])
+            return next(listings)
+
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=[_resp(p) for p in responses])
+        mock_client.get = AsyncMock(side_effect=fake_get)
         plugin.feature_client = mock_client
         return plugin, mock_client
 
@@ -340,6 +366,21 @@ class TestDirectorySearch:
         ]
     }
     _GATED = {"error": {"code": 499, "message": "Token Required"}}
+    # 3 listings (root, Hosted, GeoDepot) + 4 queryable services described.
+    _WALK_REQUESTS = 3 + 4
+    _METADATA = {
+        "Hosted/Floodplain/FeatureServer": {
+            "serviceDescription": "",
+            "description": "<p>FEMA flood hazard zones; clipped to parcels.</p>",
+            "copyrightText": "SanGIS",
+            "layers": [{"id": 0, "name": "Flood_Zones"}],
+        },
+        "Hosted/Parcels/FeatureServer": {
+            "description": "Assessor parcels",
+            "copyrightText": "SanGIS",
+            "layers": [{"id": 0, "name": "Parcels"}],
+        },
+    }
 
     @pytest.mark.asyncio
     async def test_directory_search_matches_and_skips_gated_folder(self, arcgis_config):
@@ -353,7 +394,65 @@ class TestDirectorySearch:
         assert "Hosted/Parcels/FeatureServer" in ids
         assert "Hosted/Parcels_Map/MapServer" in ids
         assert all("Floodplain" not in i for i in ids)
-        assert mock_client.get.call_count == 3
+        assert mock_client.get.call_count == self._WALK_REQUESTS
+
+    @pytest.mark.asyncio
+    async def test_directory_search_uses_description_and_layer_names(
+        self, arcgis_config
+    ):
+        plugin, _ = self._plugin(
+            arcgis_config, [self._ROOT, self._HOSTED, self._GATED], self._METADATA
+        )
+        # "fema" appears only in Floodplain's description ...
+        results = await plugin.search_datasets("fema", 10)
+        assert [r["id"] for r in results] == ["Hosted/Floodplain/FeatureServer"]
+        assert results[0]["description"] == (
+            "FEMA flood hazard zones; clipped to parcels."
+        )
+        # ... "flood zones" only in its layer name (name has no space) ...
+        results = await plugin.search_datasets("flood zones", 10)
+        assert [r["id"] for r in results] == ["Hosted/Floodplain/FeatureServer"]
+        # ... and a name match outranks a description-only match.
+        results = await plugin.search_datasets("parcels", 10)
+        assert [r["id"] for r in results] == [
+            "Hosted/Parcels/FeatureServer",
+            "Hosted/Parcels_Map/MapServer",
+            "Hosted/Floodplain/FeatureServer",
+        ]
+        assert results[0]["description"] == "Assessor parcels"
+        # Every term must match somewhere: no partial-term hits.
+        assert await plugin.search_datasets("fema parcels_map", 10) == []
+
+    @pytest.mark.asyncio
+    async def test_directory_enrichment_failure_leaves_service_bare(
+        self, arcgis_config, caplog
+    ):
+        # No metadata for Parcels_Map or Bike_Lockers: their fetches raise.
+        plugin, _ = self._plugin(
+            arcgis_config, [self._ROOT, self._HOSTED, self._GATED], self._METADATA
+        )
+        with caplog.at_level(logging.WARNING):
+            results = await plugin.search_datasets("bike", 10)
+        assert [r["id"] for r in results] == ["Bike_Lockers/FeatureServer"]
+        assert results[0]["description"] == ""
+        assert "described 2 of 4 services: 2 failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_directory_enrichment_respects_wall_clock_budget(
+        self, arcgis_config, monkeypatch
+    ):
+        monkeypatch.setattr(ArcGISPlugin, "_DIRECTORY_ENRICH_BUDGET_S", 0.05)
+        plugin, _ = self._plugin(
+            arcgis_config,
+            [self._ROOT, self._HOSTED, self._GATED],
+            self._METADATA,
+            delay=5.0,
+        )
+        started = time.monotonic()
+        results = await plugin.search_datasets("floodplain", 10)
+        assert time.monotonic() - started < 2.0
+        assert [r["id"] for r in results] == ["Hosted/Floodplain/FeatureServer"]
+        assert results[0]["description"] == ""  # unfinished -> name-only
 
     @pytest.mark.asyncio
     async def test_directory_search_type_filter(self, arcgis_config):
@@ -370,7 +469,7 @@ class TestDirectorySearch:
         )
         await plugin.search_datasets("parcels", 10)
         await plugin.search_datasets("floodplain", 10)  # served from cache
-        assert mock_client.get.call_count == 3
+        assert mock_client.get.call_count == self._WALK_REQUESTS
 
 
 # ── schema / distinct values / spatial point ──────────────────────────

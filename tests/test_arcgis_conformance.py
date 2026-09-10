@@ -420,6 +420,21 @@ class TestGetDataset:
 
 class TestGetAggregations:
     @pytest.mark.asyncio
+    async def test_directory_mode_flags_facets_the_directory_lacks(self, plugin):
+        plugin._search_mode = "directory"
+        with patch.object(
+            plugin, "_search_items", new_callable=AsyncMock, return_value=[]
+        ):
+            tags = await plugin.execute_tool("get_aggregations", {"field": "tags"})
+            types = await plugin.execute_tool("get_aggregations", {"field": "type"})
+        s = assert_conforms(plugin, "get_aggregations", tags)
+        assert codes(s) == ["directory_mode", "no_results"]
+        assert "records no tags" in tags.content[0]["text"]
+        assert codes(assert_conforms(plugin, "get_aggregations", types)) == [
+            "no_results"
+        ]
+
+    @pytest.mark.asyncio
     async def test_type_facets(self, plugin):
         items = [PORTAL_ITEM, {**PORTAL_ITEM, "id": "b" * 32, "type": "Web Map"}]
         plugin.portal_client.get = AsyncMock(return_value=resp({"results": items}))
