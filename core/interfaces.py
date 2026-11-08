@@ -21,19 +21,26 @@ class PluginType(str, Enum):
 
 
 class ToolInputError(ValueError):
-    """A tool argument the CALLER got wrong.
+    """Raised when a tool rejects the caller's arguments.
 
-    Distinguishes "you asked for something invalid" from "this server or
-    its upstream broke". The plugin's execute_tool logs these at WARNING
-    with no traceback: a bad dataset id or an unparseable WHERE clause is
-    not a server incident, and a stack trace for one buries real faults.
+    A marker, not a behaviour change: it exists so the outer handler can
+    tell "the caller asked for something invalid" from "this server
+    broke", and log the first at WARNING with no traceback. A traceback
+    is a claim that the server failed; spending one on "you forgot
+    item_id" is what makes real faults hard to find.
 
-    Deliberately NOT inferred from ValueError alone: json.JSONDecodeError
-    subclasses ValueError, and "Feature Service returned non-JSON" is a
-    genuine upstream fault that must keep its traceback.
+    Deliberately NOT inferred from ValueError alone. That heuristic is
+    wrong in two ways here:
+      * json.JSONDecodeError subclasses ValueError, so a malformed
+        upstream payload would be misfiled as a caller mistake and lose
+        its stack trace.
+      * The ArcGIS wrapper raises plain ValueError for "Feature Service
+        returned non-JSON" -- a genuine upstream fault whose traceback
+        we want.
+    Both stay plain ValueError and keep their tracebacks.
 
-    Subclasses ValueError so existing ``except ValueError`` handlers keep
-    working unchanged.
+    Subclasses ValueError so every existing `except ValueError` keeps
+    working, which makes converting a raise site mechanical and safe.
     """
 
 
@@ -42,23 +49,27 @@ class InvalidToolParamsError(ValueError):
 
     Covers the cases the MCP tools spec calls "requests that fail to
     satisfy the CallToolRequest schema" -- a missing tool name, or
-    ``arguments`` that is not an object. Mapped to JSON-RPC -32602
+    `arguments` that is not an object. Mapped to JSON-RPC -32602
     ("Invalid params"): the request never described a valid call, so it
     is neither a server fault (-32603) nor a tool execution error.
 
-    Subclasses ValueError so existing ``except ValueError`` handlers keep
-    working unchanged.
+    Subclasses ValueError for the same reason UnknownToolError does.
     """
 
 
 class UnknownToolError(ValueError):
     """Raised when tools/call names a tool this server does not expose.
 
+    Subclasses ValueError deliberately: it is an argument problem, and
+    existing `except ValueError` handlers around execute_tool keep
+    working unchanged.
+
     Mapped to JSON-RPC -32602 with the message shape the MCP tools spec
     uses ("Unknown tool: <name>") rather than the generic -32603
     "Internal error": naming a missing tool is a caller mistake, not a
-    server fault. The available-tool list travels in ``data`` so a model
-    can self-correct.
+    server fault. Clients are told they MAY surface protocol errors to
+    the model, so the available-tool list travels in `data` to let a
+    model self-correct.
     """
 
     def __init__(self, tool_name: str, available: str = "") -> None:
@@ -84,21 +95,20 @@ class ToolDefinition(BaseModel):
     input_schema: Dict[str, Any] = Field(
         ..., description="JSON Schema for tool input parameters"
     )
+    output_schema: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional JSON Schema for the tool's structured result. "
+            "Declaring one is a commitment: the MCP spec requires that "
+            "structured results conform to it, and clients may validate. "
+            "Only set this for tools that return structured_content."
+        ),
+    )
     annotations: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
             "Optional MCP tool annotations (e.g. readOnlyHint, openWorldHint) "
             "that hint at a tool's behavior to clients."
-        ),
-    )
-    output_schema: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Optional JSON Schema for the tool's structuredContent. A declared "
-            "schema is BINDING: the spec says servers MUST return conforming "
-            "results. Declare one only if EVERY successful return path emits "
-            "conforming structured content -- including the empty, truncated "
-            "and not-found branches."
         ),
     )
 
@@ -109,14 +119,16 @@ class ToolResult(BaseModel):
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool output content"
     )
-    success: bool = Field(..., description="Whether the tool execution succeeded")
-    structured_content: Optional[Dict[str, Any]] = Field(
+    structured_content: Optional[Any] = Field(
         default=None,
         description=(
-            "Machine-readable result, surfaced as `structuredContent`. Must "
-            "conform to the tool's declared output_schema."
+            "Optional machine-readable result, emitted as the MCP "
+            "`structuredContent` field. Must conform to the tool's "
+            "output_schema when one is declared. The human-readable "
+            "`content` is still sent alongside it."
         ),
     )
+    success: bool = Field(..., description="Whether the tool execution succeeded")
     error_message: Optional[str] = Field(
         None, description="Error message if execution failed"
     )

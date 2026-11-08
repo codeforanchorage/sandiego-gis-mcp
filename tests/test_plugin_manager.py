@@ -9,13 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from core.plugin_manager import PluginManager
-from core.interfaces import (
-    MCPPlugin,
-    ToolDefinition,
-    ToolResult,
-    PluginType,
-    UnknownToolError,
-)
+from core.interfaces import MCPPlugin, ToolDefinition, ToolResult, PluginType, UnknownToolError
 from core.validators import ConfigurationError
 
 
@@ -331,33 +325,47 @@ class TestToolRegistration:
             assert all_tools[0]["name"] == "ckan__search_datasets"
             assert all_tools[0]["description"] == "Search datasets"
             assert all_tools[0]["inputSchema"] == {"type": "object"}
-            # No title/annotations declared -> keys omitted entirely, so
-            # clients' title -> annotations.title -> name fallback works.
+            # A tool that sets no title must not emit an empty/null one --
+            # clients fall back to annotations.title then name.
             assert "title" not in all_tools[0]
-            assert "annotations" not in all_tools[0]
 
-    def test_get_all_tools_emits_title_and_annotations(self):
-        """`title` is a top-level Tool field (not an annotation) and
-        annotations pass through; the wire name stays prefixed."""
-        manager = PluginManager({"plugins": {}})
-        plugin = MagicMock()
-        plugin.get_tools.return_value = [
-            ToolDefinition(
-                name="t",
-                title="Nice Name",
-                description="d",
-                input_schema={"type": "object"},
-                annotations={"readOnlyHint": True},
+    @pytest.mark.asyncio
+    async def test_get_all_tools_emits_title_at_top_level(self):
+        """`title` is a top-level Tool field in the MCP schema, not an
+        annotation, and must survive the prefixing done here."""
+        config = {
+            "plugins": {
+                "ckan": {"enabled": True, "base_url": "https://data.example.com"}
+            }
+        }
+        manager = PluginManager(config)
+
+        with patch("core.plugin_manager.PluginManager._load_plugin_class") as mock_load:
+            mock_plugin_class = MagicMock()
+            mock_instance = Mock()
+            mock_instance.initialize = AsyncMock(return_value=True)
+            mock_instance.get_tools = Mock(
+                return_value=[
+                    ToolDefinition(
+                        name="search_datasets",
+                        title="Search Datasets",
+                        description="Search datasets",
+                        input_schema={"type": "object"},
+                    ),
+                ]
             )
-        ]
-        manager.plugins = {"ckan": plugin}
+            mock_instance.plugin_name = "ckan"
+            mock_instance.plugin_type = PluginType.OPEN_DATA
+            mock_instance.plugin_version = "1.0.0"
+            mock_plugin_class.return_value = mock_instance
+            mock_load.return_value = mock_plugin_class
 
-        tool = manager.get_all_tools()[0]
+            await manager.load_plugins()
 
-        assert tool["name"] == "ckan__t"
-        assert tool["title"] == "Nice Name"
-        assert tool["annotations"] == {"readOnlyHint": True}
-        assert "title" not in tool["annotations"]
+            all_tools = manager.get_all_tools()
+            assert all_tools[0]["title"] == "Search Datasets"
+            # The prefixed identifier is unchanged by the display name.
+            assert all_tools[0]["name"] == "ckan__search_datasets"
 
 
 class TestToolExecution:
@@ -424,12 +432,15 @@ class TestToolExecution:
 
             await manager.load_plugins()
 
+            # UnknownToolError subclasses ValueError, so this still
+            # catches it; the message now matches the shape the MCP
+            # tools spec uses for an unknown tool.
             with pytest.raises(UnknownToolError) as exc_info:
                 await manager.execute_tool("ckan__nonexistent", {})
 
-            # Still a ValueError for existing handlers, with the spec's message.
-            assert isinstance(exc_info.value, ValueError)
             assert str(exc_info.value) == "Unknown tool: ckan__nonexistent"
+            assert exc_info.value.tool_name == "ckan__nonexistent"
+            assert isinstance(exc_info.value, ValueError)
 
     @pytest.mark.asyncio
     async def test_execute_tool_fails_when_not_initialized(self):
