@@ -508,14 +508,14 @@ try:
     err = (body or {}).get("error", {})
     ok = (
         status == 400
-        and err.get("code") == -32600
+        and err.get("code") == -32022
         and "2025-11-25" in (err.get("data") or {}).get("supported", [])
     )
     check(
-        "bad MCP-Protocol-Version -> 400/-32600", ok, f"HTTP {status} {str(err)[:50]}"
+        "bad MCP-Protocol-Version -> 400/-32022", ok, f"HTTP {status} {str(err)[:50]}"
     )
 except Exception as e:
-    check("bad MCP-Protocol-Version -> 400/-32600", False, repr(e))
+    check("bad MCP-Protocol-Version -> 400/-32022", False, repr(e))
 
 try:
     status, _, body = raw(
