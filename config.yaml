@@ -20,6 +20,14 @@ organization: "SANDAG/SanGIS"
 # with any behaviour change worth telling a client apart by.
 server_version: "1.2.0"
 
+# Largest request body accepted, in bytes (HTTP 413 above it). This is the
+# ONLY body limit below API Gateway's 10 MB: the fleet WAF exempts this
+# host from its 8 KB body rule so an inline GeoJSON polygon
+# (`filter_geometry`, up to 10,000 vertices, about 250 KB) can get through
+# -- see allow_large_body in mcp-stats/terraform/aws/variables.tf. Do not
+# remove it while that exemption is on.
+server_max_body_bytes: 1048576
+
 # Per-deployment guidance returned in the MCP `initialize` response as
 # `instructions`. Model-agnostic: clients prepend it to the model's context
 # once, before any tool is called, so this is the highest-leverage place for
